@@ -1057,9 +1057,9 @@ impl WaylandWindowStatePtr {
         let client = state.client.clone();
         let ime_enabled = if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            let accepts_text_input = input_handler.query_accepts_text_input();
+            let ime_enabled = ime_enabled_for(&mut input_handler);
             self.state.borrow_mut().input_handler = Some(input_handler);
-            accepts_text_input
+            ime_enabled
         } else {
             drop(state);
             false
@@ -2529,6 +2529,10 @@ enum BackgroundBlurProtocol {
     Kde,
 }
 
+fn ime_enabled_for(input_handler: &mut PlatformInputHandler) -> bool {
+    input_handler.query_prefers_ime_for_printable_keys()
+}
+
 fn output_scale_sets_buffer_scale(surface_version: u32, fractional_scaling: bool) -> bool {
     !fractional_scaling && surface_version < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE
 }
@@ -2737,14 +2741,107 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use gpui::{
-        Bounds, Corners, DevicePixels, Point, Scene, Size, WindowCornerMask, point, px, size,
+        App, Bounds, Corners, DevicePixels, InputHandler, KeyBinding, Pixels, PlatformInputHandler,
+        Point, Scene, Size, TestAppContext, UTF16Selection, Window, WindowCornerMask, actions,
+        point, px, size,
     };
 
     use super::{
         BackgroundBlurProtocol, BackgroundEffectRegion, background_blur_protocol,
-        background_effect_rectangles, output_scale_sets_buffer_scale,
+        background_effect_rectangles, ime_enabled_for, output_scale_sets_buffer_scale,
     };
+
+    actions!(wayland_window_test, [ChordAction]);
+
+    struct TextField;
+
+    impl InputHandler for TextField {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            None
+        }
+
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+
+        fn text_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            None
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _: Point<Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            None
+        }
+
+        fn prefers_ime_for_printable_keys(&mut self, _: &mut Window, _: &mut App) -> bool {
+            true
+        }
+    }
+
+    #[gpui::test]
+    fn ime_stays_off_until_a_pending_chord_resolves(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-k m", ChordAction, None)]));
+        let cx = cx.add_empty_window();
+        let mut input_handler = cx.update(|window, cx| {
+            PlatformInputHandler::new(window.to_async(cx), Box::new(TextField))
+        });
+
+        assert!(ime_enabled_for(&mut input_handler));
+        cx.simulate_keystrokes("ctrl-k");
+        cx.update(|window, _| assert!(window.has_pending_keystrokes()));
+        assert!(!ime_enabled_for(&mut input_handler));
+        cx.simulate_keystrokes("m");
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert!(ime_enabled_for(&mut input_handler));
+    }
 
     fn rectangles_cover(rectangles: &[Bounds<i32>], x: i32, y: i32) -> bool {
         rectangles.iter().any(|rectangle| {
