@@ -1405,8 +1405,10 @@ impl WaylandWindowStatePtr {
                 let scale = state.primary_output_scale();
                 state.update_subpixel_layout();
 
-                // We use `PreferredBufferScale` instead to set the scale if it's available
-                if state.surface.version() < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE {
+                if output_scale_sets_buffer_scale(
+                    state.surface.version(),
+                    state.globals.fractional_scale_manager.is_some(),
+                ) {
                     state.surface.set_buffer_scale(scale);
                     drop(state);
                     self.rescale(scale as f32);
@@ -1421,8 +1423,10 @@ impl WaylandWindowStatePtr {
                 let scale = state.primary_output_scale();
                 state.update_subpixel_layout();
 
-                // We use `PreferredBufferScale` instead to set the scale if it's available
-                if state.surface.version() < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE {
+                if output_scale_sets_buffer_scale(
+                    state.surface.version(),
+                    state.globals.fractional_scale_manager.is_some(),
+                ) {
                     state.surface.set_buffer_scale(scale);
                     drop(state);
                     self.rescale(scale as f32);
@@ -2525,6 +2529,10 @@ enum BackgroundBlurProtocol {
     Kde,
 }
 
+fn output_scale_sets_buffer_scale(surface_version: u32, fractional_scaling: bool) -> bool {
+    !fractional_scaling && surface_version < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE
+}
+
 fn background_blur_protocol(
     has_ext_manager: bool,
     ext_blur_supported: bool,
@@ -2735,7 +2743,7 @@ mod tests {
 
     use super::{
         BackgroundBlurProtocol, BackgroundEffectRegion, background_blur_protocol,
-        background_effect_rectangles,
+        background_effect_rectangles, output_scale_sets_buffer_scale,
     };
 
     fn rectangles_cover(rectangles: &[Bounds<i32>], x: i32, y: i32) -> bool {
@@ -2745,6 +2753,14 @@ mod tests {
                 && x < rectangle.origin.x + rectangle.size.width
                 && y < rectangle.origin.y + rectangle.size.height
         })
+    }
+
+    #[test]
+    fn output_scale_yields_to_fractional_and_preferred_buffer_scale() {
+        assert!(output_scale_sets_buffer_scale(5, false));
+        assert!(!output_scale_sets_buffer_scale(5, true));
+        assert!(!output_scale_sets_buffer_scale(6, false));
+        assert!(!output_scale_sets_buffer_scale(6, true));
     }
 
     #[test]
