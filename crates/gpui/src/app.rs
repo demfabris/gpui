@@ -75,6 +75,8 @@ mod visual_test_context;
 /// [Context::on_app_quit] before fully quitting.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
 
+const MAX_NOTIFIES_PER_FLUSH: usize = 1024;
+
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
 /// Strongly consider removing after stabilization.
 #[doc(hidden)]
@@ -1795,13 +1797,25 @@ impl App {
     /// such as notifying observers, emitting events, etc. Effects can themselves
     /// cause effects, so we continue looping until all effects are processed.
     fn flush_effects(&mut self) {
+        let mut notifications = FxHashMap::<EntityId, usize>::default();
         loop {
             self.release_dropped_entities();
             self.release_dropped_focus_handles();
             if let Some(effect) = self.pending_effects.pop_front() {
                 match effect {
                     Effect::Notify { emitter } => {
-                        self.apply_notify_effect(emitter);
+                        let count = notifications.entry(emitter).or_default();
+                        *count += 1;
+                        if *count <= MAX_NOTIFIES_PER_FLUSH {
+                            self.apply_notify_effect(emitter);
+                        } else {
+                            if *count == MAX_NOTIFIES_PER_FLUSH + 1 {
+                                log::error!(
+                                    "{emitter:?} was notified {MAX_NOTIFIES_PER_FLUSH} times while flushing one update, so its observers notify it back in a cycle; dropping its notifications until this flush ends"
+                                );
+                            }
+                            self.pending_notifications.remove(&emitter);
+                        }
                     }
 
                     Effect::Emit {
@@ -3544,6 +3558,44 @@ mod test {
                 assert!(handles.get(shared.id).is_some());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn notify_cycle_ends_within_one_flush(cx: &mut TestAppContext) {
+        struct Cycle;
+        let observed = Rc::new(Cell::new(0));
+        let first = cx.update(|cx| {
+            let first = cx.new(|_| Cycle);
+            let second = cx.new(|_| Cycle);
+            cx.observe(&first, {
+                let second = second.clone();
+                let observed = observed.clone();
+                move |_, cx| {
+                    observed.set(observed.get() + 1);
+                    second.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
+            cx.observe(&second, {
+                let first = first.clone();
+                let observed = observed.clone();
+                move |_, cx| {
+                    observed.set(observed.get() + 1);
+                    first.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
+            first.update(cx, |_, cx| cx.notify());
+            first
+        });
+        let cut_off = observed.get();
+        assert!(
+            (2 * super::MAX_NOTIFIES_PER_FLUSH - 1..=2 * super::MAX_NOTIFIES_PER_FLUSH)
+                .contains(&cut_off)
+        );
+
+        first.update(cx, |_, cx| cx.notify());
+        assert_eq!(observed.get(), 2 * cut_off);
     }
 
     fn missing_glyph(grapheme: &'static str) -> MissingGlyph {
