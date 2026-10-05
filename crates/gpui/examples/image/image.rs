@@ -13,8 +13,6 @@ use gpui::{
     SharedString, SharedUri, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     img, prelude::*, px, rgb, size,
 };
-#[cfg(not(target_family = "wasm"))]
-use reqwest_client::ReqwestClient;
 
 struct Assets {
     base: PathBuf,
@@ -165,12 +163,6 @@ fn run_example() {
         if !example_support::load_fonts(cx) {
             return;
         }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let http_client = ReqwestClient::user_agent("gpui example").unwrap();
-            cx.set_http_client(Arc::new(http_client));
-        }
-
         cx.activate(true);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

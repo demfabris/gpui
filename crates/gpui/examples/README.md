@@ -122,7 +122,6 @@ clipboard.
 - `gif_viewer` shows GIF rendering.
 - `gradient` demonstrates linear gradients and color spaces.
 - `image` shows local and remote image loading, image sizing, and asset setup.
-- `image_gallery` demonstrates image caching and loading remote images.
 - `image_loading` shows image loading states and asset loading.
 - `painting` demonstrates custom drawing with paths and canvas.
 - `svg` shows SVG rendering.
