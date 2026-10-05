@@ -46,6 +46,9 @@ windows-registry.workspace = true
 workspace = true
 optional = true
 
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [target.'cfg(target_os = "windows")'.build-dependencies]
 windows-registry.workspace = true
 

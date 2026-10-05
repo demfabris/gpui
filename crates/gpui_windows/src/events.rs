@@ -261,6 +261,7 @@ impl WindowsWindowInner {
                 .callbacks
                 .request_frame
                 .set(Some(restore_from_minimized));
+            self.state.frame_requester.request();
         } else {
             should_resize_renderer = true;
         }
@@ -285,6 +286,7 @@ impl WindowsWindowInner {
             self.state
                 .invalidate_devices
                 .store(true, std::sync::atomic::Ordering::Release);
+            self.state.frame_requester.request();
         }
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
@@ -341,6 +343,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.state.frame_requester.close();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -1334,11 +1337,11 @@ impl WindowsWindowInner {
             }
             // Validate the region so a nested message pump doesn't keep
             // re-dispatching WM_PAINT for the still-invalid region in a busy
-            // loop until the in-progress draw unwinds. The vsync thread
-            // re-invalidates every window on each vsync (see
-            // `begin_vsync_thread`), so the deferred frame still gets drawn,
-            // at most one vsync late.
+            // loop until the in-progress draw unwinds, and ask the vsync
+            // thread for another frame so the deferred draw lands at most one
+            // vsync late.
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+            self.state.frame_requester.request();
             return Some(0);
         };
         let mut request_frame = self.state.callbacks.request_frame.take()?;

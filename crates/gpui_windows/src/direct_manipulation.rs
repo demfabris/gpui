@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui::*;
@@ -18,6 +19,8 @@ use crate::*;
 /// visual output.
 const DEFAULT_VIEWPORT_SIZE: i32 = 1000;
 
+const CONTACT_UPDATE_GRACE: Duration = Duration::from_millis(500);
+
 pub(crate) struct DirectManipulationHandler {
     manager: IDirectManipulationManager,
     update_manager: IDirectManipulationUpdateManager,
@@ -26,10 +29,12 @@ pub(crate) struct DirectManipulationHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    frame_requester: FrameRequester,
+    contact_started_at: Cell<Option<Instant>>,
 }
 
 impl DirectManipulationHandler {
-    pub fn new(window: HWND, scale_factor: f32) -> Result<Self> {
+    pub fn new(window: HWND, scale_factor: f32, frame_requester: FrameRequester) -> Result<Self> {
         unsafe {
             let manager: IDirectManipulationManager =
                 CoCreateInstance(&DirectManipulationManager, None, CLSCTX_INPROC_SERVER)?;
@@ -71,6 +76,7 @@ impl DirectManipulationHandler {
                     window,
                     Rc::clone(&scale_factor),
                     Rc::clone(&pending_events),
+                    frame_requester.clone(),
                 )
                 .into();
 
@@ -86,6 +92,8 @@ impl DirectManipulationHandler {
                 window,
                 scale_factor,
                 pending_events,
+                frame_requester,
+                contact_started_at: Cell::new(None),
             })
         }
     }
@@ -101,6 +109,8 @@ impl DirectManipulationHandler {
             if GetPointerType(pointer_id, &mut pointer_type).is_ok() && pointer_type == PT_TOUCHPAD
             {
                 self.viewport.SetContact(pointer_id).log_err();
+                self.contact_started_at.set(Some(Instant::now()));
+                self.frame_requester.request();
             }
         }
     }
@@ -108,6 +118,24 @@ impl DirectManipulationHandler {
     pub fn update(&self) {
         unsafe {
             self.update_manager.Update(None).log_err();
+        }
+        if self.is_manipulating() {
+            self.frame_requester.request();
+        }
+    }
+
+    fn is_manipulating(&self) -> bool {
+        let status = unsafe { self.viewport.GetStatus() }.unwrap_or(DIRECTMANIPULATION_READY);
+        if is_active_status(status) {
+            return true;
+        }
+        match self.contact_started_at.get() {
+            Some(started_at) if started_at.elapsed() < CONTACT_UPDATE_GRACE => true,
+            Some(_) => {
+                self.contact_started_at.set(None);
+                false
+            }
+            None => false,
         }
     }
 
@@ -143,6 +171,7 @@ struct DirectManipulationEventHandler {
     last_y_offset: Cell<f32>,
     scroll_phase: Cell<TouchPhase>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    frame_requester: FrameRequester,
 }
 
 impl DirectManipulationEventHandler {
@@ -150,6 +179,7 @@ impl DirectManipulationEventHandler {
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+        frame_requester: FrameRequester,
     ) -> Self {
         Self {
             window,
@@ -160,6 +190,7 @@ impl DirectManipulationEventHandler {
             last_y_offset: Cell::new(0.0),
             scroll_phase: Cell::new(TouchPhase::Started),
             pending_events,
+            frame_requester,
         }
     }
 
@@ -212,6 +243,10 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
     ) -> windows_core::Result<()> {
         if current == previous {
             return Ok(());
+        }
+
+        if is_active_status(current) {
+            self.frame_requester.request();
         }
 
         // A new gesture interrupted inertia, so end the old sequence.
@@ -351,6 +386,10 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
 
         Ok(())
     }
+}
+
+fn is_active_status(status: DIRECTMANIPULATION_STATUS) -> bool {
+    status == DIRECTMANIPULATION_RUNNING || status == DIRECTMANIPULATION_INERTIA
 }
 
 fn float_equals(f1: f32, f2: f32) -> bool {
