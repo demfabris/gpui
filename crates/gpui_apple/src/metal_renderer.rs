@@ -121,6 +121,7 @@ pub struct MetalRenderer {
     is_unified_memory: bool,
     presents_with_transaction: bool,
     underlay_active: bool,
+    shown_atlas_revision: Option<u64>,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -374,6 +375,7 @@ impl MetalRenderer {
             layer,
             presents_with_transaction: false,
             underlay_active: false,
+            shown_atlas_revision: None,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -434,6 +436,7 @@ impl MetalRenderer {
             return;
         }
         self.underlay_active = active;
+        self.shown_atlas_revision = None;
         if let Some(layer) = &self.layer {
             layer.set_opaque(self.layer_opaque());
             layer.set_presents_with_transaction(self.transactional_present());
@@ -449,6 +452,7 @@ impl MetalRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
+        self.shown_atlas_revision = None;
         if let Some(layer) = &self.layer {
             let ns_size = NSSize {
                 width: size.width.0 as f64,
@@ -503,6 +507,9 @@ impl MetalRenderer {
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
+        if self.opaque == transparent {
+            self.shown_atlas_revision = None;
+        }
         self.opaque = !transparent;
         if let Some(layer) = &self.layer {
             layer.set_opaque(self.layer_opaque());
@@ -513,7 +520,12 @@ impl MetalRenderer {
         // nothing to do
     }
 
+    pub fn shows_last_frame(&self) -> bool {
+        self.shown_atlas_revision == Some(self.sprite_atlas.revision())
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
+        self.shown_atlas_revision = None;
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -554,6 +566,7 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        self.shown_atlas_revision = Some(self.sprite_atlas.revision());
     }
 
     fn render_frame(
@@ -2240,6 +2253,73 @@ mod tests {
     }
 
     #[test]
+    fn drawn_frames_stay_shown_until_something_outside_the_scene_changes() -> Result<()> {
+        use gpui::{AtlasKey, ImageId, PlatformAtlas, RenderImageParams};
+
+        objc::rc::autoreleasepool(|| -> Result<()> {
+            let mut renderer =
+                MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+            renderer.update_drawable_size(size(16.into(), 16.into()));
+            let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(16.0), px(16.0))).scale(1.0);
+            let mut scene = Scene::default();
+            scene.insert_primitive(solid_quad(bounds, hsla(0.0, 1.0, 0.5, 1.0)));
+            scene.finish();
+            let redraw = |renderer: &mut MetalRenderer| {
+                assert!(!renderer.shows_last_frame());
+                renderer.draw(&scene);
+                assert!(renderer.shows_last_frame());
+            };
+            redraw(&mut renderer);
+
+            renderer.set_presents_with_transaction(true);
+            renderer.set_presents_with_transaction(false);
+            renderer.update_transparency(false);
+            renderer.set_underlay_active(false);
+            assert!(renderer.shows_last_frame());
+
+            let atlas = renderer.sprite_atlas().clone();
+            let key = AtlasKey::Image(RenderImageParams {
+                image_id: ImageId(1),
+                frame_index: 0,
+            });
+            let pixels = [0u8; 16];
+            atlas.get_or_insert_with(key.clone(), &mut || {
+                Ok(Some((size(2.into(), 2.into()), pixels.as_slice().into())))
+            })?;
+            redraw(&mut renderer);
+            atlas.get_or_insert_with(key.clone(), &mut || Ok(None))?;
+            assert!(renderer.shows_last_frame());
+            atlas.remove(&key);
+            redraw(&mut renderer);
+
+            renderer.update_drawable_size(size(32.into(), 32.into()));
+            redraw(&mut renderer);
+            renderer.update_transparency(true);
+            redraw(&mut renderer);
+            renderer.set_underlay_active(true);
+            redraw(&mut renderer);
+
+            let mut path = Path::new(point(px(0.0), px(0.0)));
+            path.line_to(point(px(16.0), px(0.0)));
+            path.line_to(point(px(0.0), px(16.0)));
+            path.content_mask.bounds = bounds.map(|value| px(value.0));
+            let mut failing = Scene::default();
+            failing.insert_primitive(path.scale(1.0));
+            failing.finish();
+            renderer.path_intermediate_texture = None;
+            renderer.draw(&failing);
+            assert!(!renderer.shows_last_frame());
+            Ok(())
+        })?;
+
+        let mut headless =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        headless.draw(&Scene::default());
+        assert!(!headless.shows_last_frame());
+        Ok(())
+    }
+
+    #[test]
     fn pending_render_frame_outlives_renderer_without_retaining_it() -> Result<()> {
         let mut renderer =
             MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
@@ -2470,4 +2550,3 @@ fn main(@location(0) position: vec2<f32>) -> @location(0) vec4<f32> {
         Ok(())
     }
 }
-

@@ -43,6 +43,10 @@ impl DirectXAtlas {
         })))
     }
 
+    pub(crate) fn revision(&self) -> u64 {
+        self.0.lock().revision()
+    }
+
     /// Returns the view backing `id`, or `None` once every tile in it has been
     /// removed. A scene can still reference such a texture when a cached view
     /// replays a paint from before the image was dropped, so callers must skip

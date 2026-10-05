@@ -463,6 +463,7 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    shown_atlas_revision: Option<u64>,
 }
 
 impl WgpuRenderer {
@@ -665,6 +666,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            shown_atlas_revision: None,
         })
     }
 }
@@ -1148,6 +1150,7 @@ impl WgpuRenderer {
         if width == self.surface_config.width && height == self.surface_config.height {
             return;
         }
+        self.shown_atlas_revision = None;
 
         let clamped_width = width.min(self.max_texture_size);
         let clamped_height = height.min(self.max_texture_size);
@@ -1193,6 +1196,9 @@ impl WgpuRenderer {
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
+        if self.is_bgr != is_bgr {
+            self.shown_atlas_revision = None;
+        }
         self.is_bgr = is_bgr;
         if let Some(core) = self.core_mut() {
             core.is_bgr = is_bgr;
@@ -1208,6 +1214,7 @@ impl WgpuRenderer {
         if new_alpha_mode == self.surface_config.alpha_mode {
             return;
         }
+        self.shown_atlas_revision = None;
         self.surface_config.alpha_mode = new_alpha_mode;
         let format = self.surface_config.format;
 
@@ -1260,8 +1267,11 @@ impl WgpuRenderer {
     /// effect in its corner wedges, so an ext-background-effect client can use
     /// this to present a clean shadowless rounded window instead.
     pub fn set_clip_window_shadows(&mut self, clip: bool) {
-        if let Some(core) = self.core_mut() {
+        if let Some(core) = self.core_mut()
+            && core.clip_window_shadows != clip
+        {
             core.clip_window_shadows = clip;
+            self.shown_atlas_revision = None;
         }
     }
 
@@ -1281,7 +1291,12 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    pub fn shows_last_frame(&self) -> bool {
+        self.shown_atlas_revision == Some(self.atlas.revision())
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        self.shown_atlas_revision = None;
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
             if matches!(self.state, RendererState::Ready { .. }) {
@@ -1374,6 +1389,7 @@ impl WgpuRenderer {
         }
 
         core.resources.queue.present(frame);
+        self.shown_atlas_revision = Some(self.atlas.revision());
         true
     }
 }
@@ -2596,6 +2612,7 @@ impl WgpuRenderer {
     /// (e.g. Android `TerminateWindow`) but you intend to re-create the
     /// surface later without losing cached atlas textures.
     pub fn unconfigure_surface(&mut self) {
+        self.shown_atlas_revision = None;
         self.state = match std::mem::replace(&mut self.state, RendererState::Released) {
             RendererState::Ready { core, surface } => {
                 drop(surface);
@@ -2662,6 +2679,7 @@ impl WgpuRenderer {
         surface.configure(&core.resources.device, &self.surface_config);
         core.resources.invalidate_intermediate_textures();
         self.state = RendererState::Ready { surface, core };
+        self.shown_atlas_revision = None;
 
         Ok(())
     }
@@ -2670,6 +2688,7 @@ impl WgpuRenderer {
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
         self.state = RendererState::Released;
+        self.shown_atlas_revision = None;
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.
@@ -3226,7 +3245,8 @@ where
         device_id_override.as_deref(),
         reject_software,
         |backends, reject_software| {
-            let instance = WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
+            let instance =
+                WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
             let surface = create_surface(&instance, raw_window_handle)?;
             let context = if reject_software {
                 WgpuContext::new_rejecting_software(instance, &surface, compositor_gpu)?
@@ -3479,7 +3499,10 @@ mod tests {
             surface.commit();
             let mut state = State::default();
             events.roundtrip(&mut state)?;
-            anyhow::ensure!(state.configured, "compositor did not configure the test window");
+            anyhow::ensure!(
+                state.configured,
+                "compositor did not configure the test window"
+            );
 
             let instance = WgpuContext::instance_with_backends(
                 Some(Box::new(connection.backend())),
@@ -3525,12 +3548,20 @@ mod tests {
                 let core = renderer.core_mut().context("ready renderer")?;
                 core.instance_data_capacity = capacity;
                 core.max_instance_data_size = maximum;
-                assert!(renderer.draw(&scene), "healthy frame after error {attempt} failed");
+                assert!(
+                    renderer.draw(&scene),
+                    "healthy frame after error {attempt} failed"
+                );
                 events.roundtrip(&mut state)?;
                 eprintln!("frame recovery attempt {attempt}: healthy frame presented");
             }
             let mut error_generation = 0;
-            assert!(context.errors().observe_error(&mut error_generation).is_none());
+            assert!(
+                context
+                    .errors()
+                    .observe_error(&mut error_generation)
+                    .is_none()
+            );
             drop(renderer);
             toplevel.destroy();
             shell_surface.destroy();
@@ -3617,6 +3648,96 @@ mod tests {
         assert_eq!(parameters.grayscale_enhanced_contrast, 1.0);
         assert_eq!(parameters.subpixel_enhanced_contrast, 0.5);
         eprintln!("nonfinite font environment renders glyph pixel {pixel:?}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drawn_frames_stay_shown_until_something_outside_the_scene_changes() -> anyhow::Result<()> {
+        use gpui::{
+            AtlasKey, DevicePixels, ImageId, PlatformAtlas, RenderImageParams, ScaledPixels, Scene,
+        };
+        use metal::foreign_types::ForeignType as _;
+
+        let layer = metal::MetalLayer::new();
+        let instance = WgpuContext::instance_with_backends(None, wgpu::Backends::METAL);
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(
+                layer.as_ptr().cast(),
+            ))
+        }?;
+        let context = WgpuContext::new(instance, &surface, None)?;
+        let atlas = Arc::new(WgpuAtlas::from_context(&context));
+        let side = |side| Size {
+            width: DevicePixels(side),
+            height: DevicePixels(side),
+        };
+        let mut renderer = WgpuRenderer::new_internal(
+            None,
+            &context,
+            surface,
+            WgpuSurfaceConfig {
+                size: side(16),
+                transparent: false,
+                preferred_present_mode: None,
+            },
+            None,
+            atlas.clone(),
+        )?;
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: ScaledPixels(16.0),
+                height: ScaledPixels(16.0),
+            },
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: gpui::red().into(),
+            ..Default::default()
+        });
+        scene.finish();
+        let redraw = |renderer: &mut WgpuRenderer| {
+            assert!(!renderer.shows_last_frame());
+            assert!(renderer.draw(&scene));
+            assert!(renderer.shows_last_frame());
+        };
+        redraw(&mut renderer);
+
+        renderer.update_drawable_size(side(16));
+        renderer.update_transparency(false);
+        renderer.set_subpixel_layout(false);
+        renderer.set_clip_window_shadows(false);
+        assert!(renderer.shows_last_frame());
+
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let pixels = [0u8; 16];
+        atlas.get_or_insert_with(key.clone(), &mut || {
+            Ok(Some((side(2), pixels.as_slice().into())))
+        })?;
+        redraw(&mut renderer);
+        atlas.remove(&key);
+        redraw(&mut renderer);
+
+        renderer.update_drawable_size(side(32));
+        redraw(&mut renderer);
+        if renderer.transparent_alpha_mode != renderer.opaque_alpha_mode {
+            renderer.update_transparency(true);
+            redraw(&mut renderer);
+        }
+        renderer.set_subpixel_layout(true);
+        redraw(&mut renderer);
+        renderer.set_clip_window_shadows(true);
+        redraw(&mut renderer);
+
+        renderer.unconfigure_surface();
+        assert!(!renderer.draw(&scene));
+        assert!(!renderer.shows_last_frame());
         Ok(())
     }
 

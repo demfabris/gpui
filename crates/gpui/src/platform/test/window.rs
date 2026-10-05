@@ -48,6 +48,8 @@ pub(crate) struct TestWindowState {
     frame_wake_count: Rc<Cell<usize>>,
     frame_scheduled: bool,
     frame_callback_pending: bool,
+    draw_count: usize,
+    shows_last_frame: bool,
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
@@ -121,6 +123,8 @@ impl TestWindow {
             frame_wake_count: Rc::new(Cell::new(0)),
             frame_scheduled: false,
             frame_callback_pending: false,
+            draw_count: 0,
+            shows_last_frame: false,
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
@@ -153,6 +157,14 @@ impl TestWindow {
 
     pub fn frame_scheduled(&self) -> bool {
         self.0.lock().frame_scheduled
+    }
+
+    pub fn draw_count(&self) -> usize {
+        self.0.lock().draw_count
+    }
+
+    pub fn set_shows_last_frame(&self, shows_last_frame: bool) {
+        self.0.lock().shows_last_frame = shows_last_frame;
     }
 
     pub fn simulate_visibility_change(&self, visibility: WindowVisibility) {
@@ -529,10 +541,15 @@ impl PlatformWindow for TestWindow {
         let mut state = self.0.lock();
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
+        state.draw_count += 1;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
         }
+    }
+
+    fn shows_last_frame(&self) -> bool {
+        self.0.lock().shows_last_frame
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {

@@ -250,6 +250,40 @@ impl Scene {
         self.shader_layers.sort_by_key(|layer| layer.order);
     }
 
+    pub fn draws_same_as(&self, other: &Scene) -> bool {
+        self.window_corner_mask == other.window_corner_mask
+            && self.shadows.len() == other.shadows.len()
+            && self.quads.len() == other.quads.len()
+            && self.paths.len() == other.paths.len()
+            && self.underlines.len() == other.underlines.len()
+            && self.monochrome_sprites.len() == other.monochrome_sprites.len()
+            && self.subpixel_sprites.len() == other.subpixel_sprites.len()
+            && self.polychrome_sprites.len() == other.polychrome_sprites.len()
+            && self.surfaces.len() == other.surfaces.len()
+            && self.shader_layers.len() == other.shader_layers.len()
+            && same_instances(&self.shadows, &other.shadows)
+            && same_instances(&self.quads, &other.quads)
+            && same_instances(&self.underlines, &other.underlines)
+            && same_instances(&self.monochrome_sprites, &other.monochrome_sprites)
+            && same_instances(&self.subpixel_sprites, &other.subpixel_sprites)
+            && same_instances(&self.polychrome_sprites, &other.polychrome_sprites)
+            && self
+                .paths
+                .iter()
+                .zip(&other.paths)
+                .all(|(path, other)| path.draws_same_as(other))
+            && self
+                .surfaces
+                .iter()
+                .zip(&other.surfaces)
+                .all(|(surface, other)| surface.draws_same_as(other))
+            && self
+                .shader_layers
+                .iter()
+                .zip(&other.shader_layers)
+                .all(|(layer, other)| layer.draws_same_as(other))
+    }
+
     #[cfg_attr(
         all(
             any(target_os = "linux", target_os = "freebsd"),
@@ -931,6 +965,21 @@ pub struct PaintSurface {
     pub texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
 }
 
+impl PaintSurface {
+    fn draws_same_as(&self, other: &Self) -> bool {
+        #[cfg(target_os = "macos")]
+        let holes = self.image_buffer.is_none() && other.image_buffer.is_none();
+        #[cfg(not(target_os = "macos"))]
+        let holes = false;
+        holes
+            && self.order == other.order
+            && self.bounds == other.bounds
+            && self.content_mask == other.content_mask
+            && self.corner_radii == other.corner_radii
+            && self.corner_smoothing.to_bits() == other.corner_smoothing.to_bits()
+    }
+}
+
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
@@ -1069,6 +1118,16 @@ impl Path<Pixels> {
     }
 }
 
+impl Path<ScaledPixels> {
+    fn draws_same_as(&self, other: &Self) -> bool {
+        self.order == other.order
+            && self.bounds == other.bounds
+            && self.content_mask == other.content_mask
+            && self.color == other.color
+            && self.vertices == other.vertices
+    }
+}
+
 impl<T> Path<T>
 where
     T: Clone + Debug + Default + PartialEq + PartialOrd + Add<T, Output = T> + Sub<Output = T>,
@@ -1086,7 +1145,7 @@ impl From<Path<ScaledPixels>> for Primitive {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct PathVertex<P: Clone + Debug + Default + PartialEq> {
@@ -1182,6 +1241,25 @@ pub struct ShaderLayer {
     pub scene: Rc<Scene>,
 }
 
+impl ShaderLayer {
+    fn draws_same_as(&self, other: &Self) -> bool {
+        self.order == other.order
+            && self.bounds == other.bounds
+            && self.content_mask == other.content_mask
+            && self.shader.id() == other.shader.id()
+            && self.uniforms == other.uniforms
+            && self.scene.draws_same_as(&other.scene)
+    }
+}
+
+fn same_instances<T: Copy>(instances: &[T], others: &[T]) -> bool {
+    instance_bytes(instances) == instance_bytes(others)
+}
+
+fn instance_bytes<T: Copy>(instances: &[T]) -> &[u8] {
+    unsafe { slice::from_raw_parts(instances.as_ptr().cast(), size_of_val(instances)) }
+}
+
 impl Debug for ShaderLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShaderLayer")
@@ -1249,6 +1327,252 @@ mod tests {
         let mut scene = Scene::default();
         paint(&mut scene);
         assert_nested(&scene);
+    }
+
+    fn device_bounds(x: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(point(px(x), px(0.)), size(px(4.), px(4.))).scale(1.0)
+    }
+
+    fn tile() -> AtlasTile {
+        AtlasTile {
+            texture_id: AtlasTextureId {
+                index: 0,
+                kind: crate::AtlasTextureKind::Monochrome,
+            },
+            tile_id: crate::TileId(1),
+            padding: 0,
+            bounds: Bounds::new(
+                point(crate::DevicePixels(0), crate::DevicePixels(0)),
+                size(crate::DevicePixels(4), crate::DevicePixels(4)),
+            ),
+        }
+    }
+
+    fn path(x: f32) -> Path<ScaledPixels> {
+        let mut path = Path::new(point(px(x), px(0.)));
+        path.line_to(point(px(x + 4.), px(0.)));
+        path.line_to(point(px(x), px(4.)));
+        path.content_mask.bounds = Bounds::new(point(px(0.), px(0.)), size(px(64.), px(64.)));
+        path.scale(1.0)
+    }
+
+    fn shader_layer(uniforms: &[u8]) -> ShaderLayerDescriptor {
+        ShaderLayerDescriptor {
+            uniforms: Arc::from(uniforms),
+            ..layer_descriptor()
+        }
+    }
+
+    struct Content {
+        shadow: Shadow,
+        quad: Quad,
+        path: Path<ScaledPixels>,
+        underline: Underline,
+        monochrome: MonochromeSprite,
+        subpixel: SubpixelSprite,
+        polychrome: PolychromeSprite,
+        layer_uniforms: Vec<u8>,
+        layer_quad_x: f32,
+        corner_mask: Option<WindowCornerMask>,
+    }
+
+    impl Content {
+        fn new() -> Self {
+            let bounds = device_bounds(0.);
+            let content_mask = ContentMask { bounds };
+            Self {
+                shadow: Shadow {
+                    order: 0,
+                    blur_radius: ScaledPixels(2.),
+                    bounds,
+                    corner_radii: Corners::default(),
+                    content_mask,
+                    color: Hsla::black(),
+                    element_bounds: bounds,
+                    element_corner_radii: Corners::default(),
+                    inset: 0,
+                    corner_smoothing: 2.,
+                },
+                quad: quad(4.),
+                path: path(8.),
+                underline: Underline {
+                    order: 0,
+                    pad: 0,
+                    bounds: device_bounds(12.),
+                    content_mask: ContentMask {
+                        bounds: device_bounds(12.),
+                    },
+                    color: Hsla::black(),
+                    thickness: ScaledPixels(1.),
+                    wavy: false.into(),
+                },
+                monochrome: MonochromeSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds: device_bounds(16.),
+                    content_mask: ContentMask {
+                        bounds: device_bounds(16.),
+                    },
+                    color: Hsla::black(),
+                    tile: tile(),
+                    transformation: TransformationMatrix::unit(),
+                },
+                subpixel: SubpixelSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds: device_bounds(20.),
+                    content_mask: ContentMask {
+                        bounds: device_bounds(20.),
+                    },
+                    color: Hsla::black(),
+                    tile: tile(),
+                    transformation: TransformationMatrix::unit(),
+                },
+                polychrome: PolychromeSprite {
+                    order: 0,
+                    pad: 0,
+                    grayscale: false.into(),
+                    opacity: 1.,
+                    bounds: device_bounds(24.),
+                    content_mask: ContentMask {
+                        bounds: device_bounds(24.),
+                    },
+                    corner_radii: Corners::default(),
+                    corner_smoothing: 2.,
+                    pad2: 0,
+                    tile: tile(),
+                },
+                layer_uniforms: vec![1, 2, 3, 4],
+                layer_quad_x: 0.,
+                corner_mask: Some(WindowCornerMask {
+                    bounds: Bounds::new(point(px(0.), px(0.)), size(px(64.), px(64.))).scale(1.0),
+                    corner_radii: Corners::all(px(8.)).scale(1.0),
+                    corner_smoothing: 2.,
+                }),
+            }
+        }
+
+        fn scene(&self) -> Scene {
+            let mut scene = Scene::default();
+            scene.insert_primitive(self.shadow);
+            scene.insert_primitive(self.quad);
+            scene.insert_primitive(self.path.clone());
+            scene.insert_primitive(self.underline);
+            scene.insert_primitive(self.monochrome);
+            scene.insert_primitive(self.subpixel);
+            scene.insert_primitive(self.polychrome);
+            scene.push_shader_layer(shader_layer(&self.layer_uniforms));
+            scene.insert_primitive(quad(self.layer_quad_x));
+            scene.pop_shader_layer();
+            scene.finish();
+            scene.window_corner_mask = self.corner_mask;
+            scene
+        }
+    }
+
+    #[test]
+    fn repainted_scenes_draw_the_same() {
+        let content = Content::new();
+        let scene = content.scene();
+        assert!(scene.draws_same_as(&content.scene()));
+        let mut replayed = Scene::default();
+        replayed.replay(0..scene.len(), &scene);
+        replayed.finish();
+        replayed.window_corner_mask = scene.window_corner_mask;
+        assert!(replayed.draws_same_as(&scene));
+    }
+
+    #[test]
+    fn any_painted_change_draws_differently() {
+        let changes: [(&str, fn(&mut Content)); 12] = [
+            ("shadow", |content| {
+                content.shadow.blur_radius = ScaledPixels(3.)
+            }),
+            ("quad", |content| content.quad.corner_smoothing = 4.),
+            ("path", |content| content.path = path(9.)),
+            ("underline", |content| content.underline.wavy = true.into()),
+            ("monochrome sprite", |content| {
+                content.monochrome.tile.tile_id = crate::TileId(2)
+            }),
+            ("subpixel sprite", |content| {
+                content.subpixel.color = Hsla::white()
+            }),
+            ("polychrome sprite", |content| {
+                content.polychrome.opacity = 0.5
+            }),
+            ("shader layer uniforms", |content| {
+                content.layer_uniforms[0] = 9
+            }),
+            ("shader layer content", |content| content.layer_quad_x = 1.),
+            ("corner mask", |content| {
+                content.corner_mask.as_mut().unwrap().corner_smoothing = 4.
+            }),
+            ("no corner mask", |content| content.corner_mask = None),
+            ("negative zero", |content| {
+                content.quad.border_widths.top = ScaledPixels(-0.)
+            }),
+        ];
+        let scene = Content::new().scene();
+        for (name, change) in changes {
+            let mut content = Content::new();
+            change(&mut content);
+            assert!(!content.scene().draws_same_as(&scene), "{name}");
+            assert!(!scene.draws_same_as(&content.scene()), "{name}");
+        }
+    }
+
+    #[test]
+    fn reordered_primitives_draw_differently() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0.));
+        scene.insert_primitive(quad(2.));
+        scene.finish();
+        let mut reordered = Scene::default();
+        reordered.insert_primitive(quad(2.));
+        reordered.insert_primitive(quad(0.));
+        reordered.finish();
+        assert!(!scene.draws_same_as(&reordered));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn surface(
+        x: f32,
+        image_buffer: Option<core_video::pixel_buffer::CVPixelBuffer>,
+    ) -> PaintSurface {
+        PaintSurface {
+            order: 0,
+            bounds: device_bounds(x),
+            content_mask: ContentMask {
+                bounds: device_bounds(x),
+            },
+            corner_radii: Corners::default(),
+            corner_smoothing: 2.,
+            image_buffer,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn surface_scene(surface: PaintSurface) -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0.));
+        scene.insert_primitive(surface);
+        scene.finish();
+        scene
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn underlay_holes_compare_by_shape_and_surfaces_never_match() {
+        use core_video::pixel_buffer::{CVPixelBuffer, kCVPixelFormatType_32BGRA};
+
+        let hole = surface_scene(surface(4., None));
+        assert!(hole.draws_same_as(&surface_scene(surface(4., None))));
+        assert!(!hole.draws_same_as(&surface_scene(surface(5., None))));
+
+        let buffer = CVPixelBuffer::new(kCVPixelFormatType_32BGRA, 4, 4, None).unwrap();
+        let frame = surface_scene(surface(4., Some(buffer.clone())));
+        assert!(!frame.draws_same_as(&surface_scene(surface(4., Some(buffer)))));
+        assert!(!frame.draws_same_as(&hole));
     }
 
     #[test]

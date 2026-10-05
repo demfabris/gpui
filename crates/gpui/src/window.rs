@@ -189,6 +189,11 @@ impl DispatchPhase {
     }
 }
 
+fn present_skip_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GPUI_PRESENT_SKIP").is_none_or(|value| value != "0"))
+}
+
 struct WindowInvalidatorInner {
     #[cfg(feature = "profiler")]
     pub window_id: WindowId,
@@ -1295,6 +1300,8 @@ pub struct Window {
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    rendered_scene_shown: bool,
+    rendered_scene_unchanged: bool,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1877,9 +1884,9 @@ impl Window {
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
                 // to prevent display underclocking during active input.
-                let needs_present = request_frame_options.require_presentation
-                    || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                let must_present = request_frame_options.require_presentation
+                    || input_rate_tracker.borrow().is_high_rate();
+                let needs_present = must_present || needs_present.get();
 
                 if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
@@ -1891,14 +1898,14 @@ impl Window {
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
-                                window.present();
+                                window.present(!must_present);
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
                     })
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, _| window.present(!must_present))
                         .log_err();
                 }
 
@@ -2158,6 +2165,8 @@ impl Window {
             visibility_observers: SubscriberSet::new(),
             hovered,
             needs_present,
+            rendered_scene_shown: false,
+            rendered_scene_unchanged: false,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3577,15 +3586,8 @@ impl Window {
         self.global_ids.finish_frame();
         self.glyph_lookup_cache.get_mut().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
-        crate::frame_stats::scene(&self.next_frame.scene, self.next_frame.hitboxes.len());
-
-        self.invalidator.set_phase(DrawPhase::Focus);
-        let previous_focus_path = self.rendered_frame.focus_path();
-        let previous_window_active = self.rendered_frame.window_active;
-        mem::swap(&mut self.rendered_frame, &mut self.next_frame);
-        self.next_frame.clear();
         let scale_factor = self.scale_factor();
-        self.rendered_frame.scene.window_corner_mask = self.window_corner_mask.map(|mask| {
+        self.next_frame.scene.window_corner_mask = self.window_corner_mask.map(|mask| {
             window_corner_mask_for_viewport(
                 mask,
                 self.platform_window.content_size(),
@@ -3594,6 +3596,27 @@ impl Window {
                 self.default_corner_smoothing,
             )
         });
+        crate::frame_stats::scene(&self.next_frame.scene, self.next_frame.hitboxes.len());
+        let scene_unchanged = self.rendered_scene_shown
+            && !self.refreshing
+            && present_skip_enabled()
+            && !self.input_rate_tracker.borrow().is_high_rate()
+            && self.platform_window.shows_last_frame()
+            && {
+                let _frame_stats =
+                    crate::frame_stats::phase(crate::frame_stats::Phase::SceneFinish);
+                self.next_frame
+                    .scene
+                    .draws_same_as(&self.rendered_frame.scene)
+            };
+
+        self.invalidator.set_phase(DrawPhase::Focus);
+        let previous_focus_path = self.rendered_frame.focus_path();
+        let previous_window_active = self.rendered_frame.window_active;
+        mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.next_frame.clear();
+        self.rendered_scene_shown = false;
+        self.rendered_scene_unchanged = scene_unchanged;
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3681,14 +3704,22 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&mut self) {
+    fn present(&mut self, skip_unchanged: bool) {
         #[cfg(feature = "profiler")]
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
-        let frame_stats = crate::frame_stats::begin_present(self.handle.window_id().as_u64());
-        self.platform_window.draw(&self.rendered_frame.scene);
+        let mut frame_stats = crate::frame_stats::begin_present(self.handle.window_id().as_u64());
+        if skip_unchanged
+            && self.rendered_scene_unchanged
+            && self.platform_window.shows_last_frame()
+        {
+            frame_stats.skipped();
+        } else {
+            self.platform_window.draw(&self.rendered_frame.scene);
+        }
         drop(frame_stats);
+        self.rendered_scene_shown = true;
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3704,7 +3735,7 @@ impl Window {
     #[cfg(all(test, feature = "profiler"))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
-            self.present();
+            self.present(false);
         }
     }
 
@@ -8377,7 +8408,7 @@ mod tests {
         Keystroke, LongPressEvent, MAX_WINDOW_ZOOM, MIN_WINDOW_ZOOM, Modifiers, MouseButton,
         MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, PlatformInput, Point, Render,
         RequestFrameOptions, ScaledPixels, StatefulInteractiveElement as _, Styled, TestAppContext,
-        TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle,
+        TestWindow, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle,
         VisualTestContext, Window, WindowAppearance, WindowOptions, canvas, div, hsla, point, px,
         size,
     };
@@ -8984,6 +9015,194 @@ mod tests {
 
         assert!(test_window.simulate_scheduled_frame());
         assert!(callback_ran.get());
+    }
+
+    struct Swatch(crate::Hsla);
+
+    impl Render for Swatch {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size(px(20.)).bg(self.0)
+        }
+    }
+
+    fn reusing_window(cx: &mut TestAppContext) -> (crate::WindowHandle<Swatch>, TestWindow) {
+        let window = cx.add_window(|_, _| Swatch(crate::red()));
+        let test_window = cx.test_window(window.into());
+        test_window.set_shows_last_frame(true);
+        window
+            .update(cx, |_, window, _| window.active.set(true))
+            .unwrap();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(test_window.draw_count() > 0);
+        (window, test_window)
+    }
+
+    fn frame_presents(
+        cx: &mut TestAppContext,
+        window: crate::WindowHandle<Swatch>,
+        test_window: &TestWindow,
+        options: RequestFrameOptions,
+    ) -> usize {
+        let draws = test_window.draw_count();
+        test_window.simulate_frame_request(options);
+        assert!(
+            !window
+                .update(cx, |_, window, _| window.needs_present.get())
+                .unwrap()
+        );
+        test_window.draw_count() - draws
+    }
+
+    fn presents(
+        cx: &mut TestAppContext,
+        window: crate::WindowHandle<Swatch>,
+        test_window: &TestWindow,
+        color: crate::Hsla,
+        options: RequestFrameOptions,
+    ) -> usize {
+        window
+            .update(cx, |swatch, _, cx| {
+                swatch.0 = color;
+                cx.notify();
+            })
+            .unwrap();
+        frame_presents(cx, window, test_window, options)
+    }
+
+    #[gpui::test]
+    fn unchanged_scenes_skip_the_present(cx: &mut TestAppContext) {
+        let (window, test_window) = reusing_window(cx);
+        let frame = RequestFrameOptions::default();
+        assert_eq!(presents(cx, window, &test_window, crate::red(), frame), 0);
+        assert_eq!(presents(cx, window, &test_window, crate::blue(), frame), 1);
+        assert_eq!(presents(cx, window, &test_window, crate::blue(), frame), 0);
+        assert_eq!(presents(cx, window, &test_window, crate::red(), frame), 1);
+    }
+
+    #[gpui::test]
+    fn windows_that_cannot_reuse_a_frame_always_present(cx: &mut TestAppContext) {
+        let (window, test_window) = reusing_window(cx);
+        test_window.set_shows_last_frame(false);
+        let frame = RequestFrameOptions::default();
+        assert_eq!(presents(cx, window, &test_window, crate::red(), frame), 1);
+        assert_eq!(presents(cx, window, &test_window, crate::red(), frame), 1);
+    }
+
+    #[gpui::test]
+    fn unchanged_scenes_present_when_something_outside_them_changed(cx: &mut TestAppContext) {
+        let (window, mut test_window) = reusing_window(cx);
+        let red = crate::red();
+        let frame = RequestFrameOptions::default();
+
+        window.update(cx, |_, window, _| window.refresh()).unwrap();
+        assert_eq!(frame_presents(cx, window, &test_window, frame), 1);
+
+        test_window.simulate_resize(size(px(640.), px(480.)));
+        assert_eq!(frame_presents(cx, window, &test_window, frame), 1);
+        assert_eq!(presents(cx, window, &test_window, red, frame), 0);
+
+        test_window.simulate_scale_factor_change(1.0);
+        assert_eq!(frame_presents(cx, window, &test_window, frame), 1);
+
+        window
+            .update(cx, |_, window, _| window.set_default_corner_smoothing(4.))
+            .unwrap();
+        assert_eq!(frame_presents(cx, window, &test_window, frame), 1);
+
+        window
+            .update(cx, |_, window, _| {
+                window.set_window_corner_mask(Some((
+                    Bounds::new(point(px(0.), px(0.)), size(px(640.), px(480.))),
+                    Corners::all(px(10.)),
+                )))
+            })
+            .unwrap();
+        assert_eq!(frame_presents(cx, window, &test_window, frame), 1);
+
+        window
+            .update(cx, |_, window, _| window.set_zoom(1.5))
+            .unwrap();
+        assert_eq!(frame_presents(cx, window, &test_window, frame), 1);
+        assert_eq!(presents(cx, window, &test_window, red, frame), 0);
+
+        let require_presentation = RequestFrameOptions {
+            require_presentation: true,
+            force_render: false,
+        };
+        assert_eq!(
+            presents(cx, window, &test_window, red, require_presentation),
+            1
+        );
+        let force_render = RequestFrameOptions {
+            require_presentation: false,
+            force_render: true,
+        };
+        assert_eq!(presents(cx, window, &test_window, red, force_render), 1);
+        assert_eq!(presents(cx, window, &test_window, red, frame), 0);
+    }
+
+    #[gpui::test]
+    fn fast_input_keeps_presenting_unchanged_scenes(cx: &mut TestAppContext) {
+        let (window, test_window) = reusing_window(cx);
+        let frame = RequestFrameOptions::default();
+        window
+            .update(cx, |_, window, _| {
+                for _ in 0..10 {
+                    window.input_rate_tracker.borrow_mut().record_input();
+                }
+            })
+            .unwrap();
+        assert_eq!(presents(cx, window, &test_window, crate::red(), frame), 1);
+        let draws = test_window.draw_count();
+        test_window.simulate_frame_request(frame);
+        assert_eq!(test_window.draw_count(), draws + 1);
+    }
+
+    #[gpui::test]
+    fn scenes_drawn_without_a_present_are_never_skipped(cx: &mut TestAppContext) {
+        let (window, test_window) = reusing_window(cx);
+        let draws = test_window.draw_count();
+        window
+            .update(cx, |swatch, _, cx| {
+                swatch.0 = crate::blue();
+                cx.notify();
+            })
+            .unwrap();
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        assert_eq!(test_window.draw_count(), draws);
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(test_window.draw_count(), draws + 1);
+    }
+
+    #[gpui::test]
+    fn skipped_presents_let_the_frame_loop_park(cx: &mut TestAppContext) {
+        let (window, test_window) = reusing_window(cx);
+        let ticks_until_parked = || {
+            let mut ticks = 0;
+            while test_window.simulate_scheduled_frame() {
+                ticks += 1;
+                assert!(ticks < 4, "the frame loop kept ticking");
+            }
+            ticks
+        };
+        ticks_until_parked();
+        let draws = test_window.draw_count();
+
+        let wakes = test_window.frame_wake_count();
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        assert_eq!(test_window.frame_wake_count(), wakes + 1);
+        assert!(ticks_until_parked() > 0);
+        assert_eq!(test_window.draw_count(), draws);
+
+        window
+            .update(cx, |swatch, _, cx| {
+                swatch.0 = crate::blue();
+                cx.notify();
+            })
+            .unwrap();
+        assert_eq!(test_window.frame_wake_count(), wakes + 2);
+        assert!(test_window.simulate_scheduled_frame());
+        assert_eq!(test_window.draw_count(), draws + 1);
     }
 
     struct RootView {

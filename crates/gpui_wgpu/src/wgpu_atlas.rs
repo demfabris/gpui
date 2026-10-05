@@ -70,6 +70,10 @@ impl WgpuAtlas {
         )
     }
 
+    pub fn revision(&self) -> u64 {
+        self.0.lock().revision()
+    }
+
     pub fn before_frame(&self) {
         let mut lock = self.0.lock();
         lock.backend.flush_uploads();

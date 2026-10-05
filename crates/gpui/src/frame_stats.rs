@@ -137,6 +137,7 @@ struct Frame {
     timestamp_unix_ns: u64,
     drawn_at_unix_ns: u64,
     presented_at_unix_ns: Option<u64>,
+    present_skipped: bool,
     draw: Timing,
     phases: Phases,
     counts: Counts,
@@ -257,6 +258,7 @@ pub(crate) fn begin_draw(
                     timestamp_unix_ns: unix_ns(),
                     drawn_at_unix_ns: 0,
                     presented_at_unix_ns: None,
+                    present_skipped: false,
                     draw: Timing::zero(started.cpu.is_some()),
                     phases: Phases::new(started.cpu.is_some()),
                     counts: Counts::default(),
@@ -340,6 +342,7 @@ impl Drop for PhaseGuard {
 pub(crate) struct PresentGuard {
     window_id: u64,
     started: Option<Stamp>,
+    skipped: bool,
 }
 
 pub(crate) fn begin_present(window_id: u64) -> PresentGuard {
@@ -348,18 +351,29 @@ pub(crate) fn begin_present(window_id: u64) -> PresentGuard {
     } else {
         None
     };
-    PresentGuard { window_id, started }
+    PresentGuard {
+        window_id,
+        started,
+        skipped: false,
+    }
+}
+
+impl PresentGuard {
+    pub(crate) fn skipped(&mut self) {
+        self.skipped = true;
+    }
 }
 
 impl Drop for PresentGuard {
     fn drop(&mut self) {
         if let Some(started) = self.started {
             let timing = Stamp::now().since(started);
-            let presented_at = unix_ns();
+            let presented_at = (!self.skipped).then(unix_ns);
             RECORDER.with_borrow_mut(|recorder| {
                 if let Some(mut frame) = recorder.pending.remove(&self.window_id) {
                     frame.phases.present_submit = Some(timing);
-                    frame.presented_at_unix_ns = Some(presented_at);
+                    frame.presented_at_unix_ns = presented_at;
+                    frame.present_skipped = self.skipped;
                     recorder.write(&frame);
                 }
             });
@@ -576,6 +590,7 @@ mod tests {
                 timestamp_unix_ns: 0,
                 drawn_at_unix_ns: 0,
                 presented_at_unix_ns: None,
+                present_skipped: false,
                 draw: Timing::zero(true),
                 phases: Phases::new(true),
                 counts: Counts::default(),

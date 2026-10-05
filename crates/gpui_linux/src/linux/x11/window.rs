@@ -1809,6 +1809,11 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    fn shows_last_frame(&self) -> bool {
+        let inner = self.0.state.borrow();
+        !inner.force_render_after_recovery && inner.renderer.shows_last_frame()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let inner = self.0.state.borrow();
         inner.renderer.sprite_atlas().clone()

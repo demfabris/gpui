@@ -990,6 +990,11 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow_mut().renderer.draw(scene);
     }
 
+    fn shows_last_frame(&self) -> bool {
+        self.inner.pending_physical_size.get().is_none()
+            && self.inner.state.borrow().renderer.shows_last_frame()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.inner.state.borrow().renderer.sprite_atlas().clone()
     }

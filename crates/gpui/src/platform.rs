@@ -1002,6 +1002,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    fn shows_last_frame(&self) -> bool {
+        false
+    }
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
@@ -1514,6 +1517,7 @@ pub trait AtlasBackend {
 #[doc(hidden)]
 pub struct AtlasState<Backend> {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    revision: u64,
     pub backend: Backend,
 }
 
@@ -1521,6 +1525,7 @@ impl<Backend> AtlasState<Backend> {
     pub fn new(backend: Backend) -> Self {
         Self {
             tiles_by_key: FxHashMap::default(),
+            revision: 0,
             backend,
         }
     }
@@ -1529,8 +1534,13 @@ impl<Backend> AtlasState<Backend> {
         self.tiles_by_key.contains_key(key)
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
         self.tiles_by_key.clear();
+        self.revision += 1;
         reset_backend(&mut self.backend);
     }
 }
@@ -1558,6 +1568,7 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
                     .backend
                     .insert(entry.key().texture_kind(), size, &bytes)?;
                 entry.insert(tile);
+                self.revision += 1;
                 Ok(Some(tile))
             }
         }
@@ -1565,6 +1576,7 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
 
     pub fn remove(&mut self, key: &AtlasKey) {
         if let Some(tile) = self.tiles_by_key.remove(key) {
+            self.revision += 1;
             self.backend.remove(tile);
         }
     }

@@ -2531,6 +2531,7 @@ dependencies = [
  "image",
  "itertools 0.14.0",
  "log",
+ "metal",
  "naga",
  "parking_lot",
  "profiling",

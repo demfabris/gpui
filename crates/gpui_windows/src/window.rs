@@ -1063,6 +1063,13 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    fn shows_last_frame(&self) -> bool {
+        self.state
+            .renderer
+            .borrow()
+            .shows_last_frame(self.state.background_appearance.get())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state

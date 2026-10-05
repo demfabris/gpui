@@ -54,6 +54,7 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    shown_frame: Option<(WindowBackgroundAppearance, u64)>,
 }
 
 /// Direct3D objects
@@ -196,6 +197,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            shown_frame: None,
         })
     }
 
@@ -326,6 +328,7 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
+        self.shown_frame = None;
         Ok(())
     }
 
@@ -334,13 +337,23 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        self.shown_frame = None;
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
         self.render(scene, background_appearance)?;
-        self.present()
+        self.present()?;
+        self.shown_frame = Some((background_appearance, self.atlas.revision()));
+        Ok(())
+    }
+
+    pub(crate) fn shows_last_frame(
+        &self,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> bool {
+        self.shown_frame == Some((background_appearance, self.atlas.revision()))
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -507,6 +520,7 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        self.shown_frame = None;
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;

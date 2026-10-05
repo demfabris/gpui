@@ -110,6 +110,7 @@ pub struct WaylandWindowState {
     appearance: WindowAppearance,
     background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
     background_effect_region: Option<BackgroundEffectRegion>,
+    drawn_with_background_effect: bool,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
@@ -611,6 +612,7 @@ impl WaylandWindowState {
             app_id: options.app_id,
             background_effect: None,
             background_effect_region: None,
+            drawn_with_background_effect: false,
             blur: None,
             viewport,
             globals,
@@ -2015,8 +2017,9 @@ impl PlatformWindow for WaylandWindow {
         // it into a translucent client-side shadow therefore reveals either a
         // raw rail or a blurred corner wedge. Keep the exact rounded effect and
         // make the unused CSD margin fully transparent while ext blur is active.
+        state.drawn_with_background_effect = state.background_effect.is_some();
         let clip_window_shadows =
-            state.background_effect.is_some() && scene.window_corner_mask.is_some();
+            state.drawn_with_background_effect && scene.window_corner_mask.is_some();
         state.renderer.set_clip_window_shadows(clip_window_shadows);
 
         // Surface state changed during this GPUI tick is included in this presentation.
@@ -2036,6 +2039,14 @@ impl PlatformWindow for WaylandWindow {
         if state.renderer.needs_redraw() {
             state.redraw_requested = true;
         }
+    }
+
+    fn shows_last_frame(&self) -> bool {
+        let state = self.borrow();
+        state.presentation == PresentationState::Presented
+            && !state.redraw_requested
+            && state.drawn_with_background_effect == state.background_effect.is_some()
+            && state.renderer.shows_last_frame()
     }
 
     fn schedule_frame(&self) {

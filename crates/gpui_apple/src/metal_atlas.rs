@@ -32,6 +32,10 @@ impl MetalAtlas {
         Some(self.0.lock().backend.texture(id)?.metal_texture.clone())
     }
 
+    pub(crate) fn revision(&self) -> u64 {
+        self.0.lock().revision()
+    }
+
     pub(crate) fn begin_frame(self: &Arc<Self>) -> MetalAtlasFrame {
         let mut state = self.0.lock();
         let textures = &mut state.backend;

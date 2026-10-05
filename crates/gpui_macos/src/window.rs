@@ -2237,6 +2237,10 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    fn shows_last_frame(&self) -> bool {
+        self.0.lock().renderer.shows_last_frame()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }
