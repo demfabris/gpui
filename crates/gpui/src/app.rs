@@ -16,6 +16,7 @@ use anyhow::{Context as _, Result, anyhow};
 use derive_more::{Deref, DerefMut};
 use futures::{Future, FutureExt, channel::oneshot, future::LocalBoxFuture};
 use itertools::Itertools;
+#[cfg(any(test, feature = "leak-detection"))]
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
@@ -903,7 +904,7 @@ impl App {
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
-                focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
+                focus_handles: Arc::default(),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
                 keyboard_mapper,
@@ -1886,6 +1887,9 @@ impl App {
 
     /// Repeatedly called during `flush_effects` to handle a focused handle being dropped.
     fn release_dropped_focus_handles(&mut self) {
+        if !self.focus_handles.take_released() {
+            return;
+        }
         self.focus_handles
             .clone()
             .write()
@@ -3318,8 +3322,9 @@ mod test {
     use std::os::unix::ffi::OsStringExt;
 
     use crate::{
-        AppContext, Context, Empty, FallbackFontClass, IntoElement, MissingGlyph, Render,
-        TestAppContext, Window,
+        AppContext, Context, Empty, FallbackFontClass, FocusHandle, InteractiveElement as _,
+        IntoElement, MissingGlyph, ParentElement as _, Render, Styled as _, TestAppContext, Window,
+        div, px,
     };
 
     struct RenderCounter(Rc<Cell<usize>>);
@@ -3458,6 +3463,87 @@ mod test {
         let (path, restart_arguments) = restart.await.expect("restart was not requested");
         assert_eq!(path, Some(restart_path));
         assert_eq!(restart_arguments, arguments);
+    }
+
+    struct FocusOwner {
+        outer: FocusHandle,
+        inner: Option<FocusHandle>,
+    }
+
+    impl Render for FocusOwner {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().track_focus(&self.outer).children(
+                self.inner
+                    .as_ref()
+                    .map(|inner| div().size(px(10.)).track_focus(inner)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn dropped_focus_handles_are_released_and_blurred(cx: &mut TestAppContext) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let events = events.clone();
+            move |window, cx| {
+                let outer = cx.focus_handle();
+                let inner = cx.focus_handle();
+                cx.on_blur(&inner, window, {
+                    let events = events.clone();
+                    move |_, _, _| events.borrow_mut().push("blur")
+                })
+                .detach();
+                cx.on_focus_out(&outer, window, {
+                    let events = events.clone();
+                    move |_, _, _, _| events.borrow_mut().push("focus out")
+                })
+                .detach();
+                FocusOwner {
+                    outer,
+                    inner: Some(inner),
+                }
+            }
+        });
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        let inner_id = window
+            .update(cx, |this, window, cx| {
+                let inner = this.inner.clone().unwrap();
+                window.focus(&inner, cx);
+                inner.id
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let shared = cx.update(|cx| {
+            let shared = cx.focus_handle();
+            drop(shared.clone());
+            shared
+        });
+        assert!(events.borrow().is_empty());
+
+        window
+            .update(cx, |this, _, cx| {
+                this.inner = None;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window.update(cx, |_, window, _| window.refresh()).unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(*events.borrow(), ["blur", "focus out"]);
+        window
+            .update(cx, |this, window, cx| {
+                assert!(window.focused(cx).is_none());
+                let handles = cx.focus_handles.read();
+                assert!(handles.get(inner_id).is_none());
+                assert!(handles.get(this.outer.id).is_some());
+                assert!(handles.get(shared.id).is_some());
+            })
+            .unwrap();
     }
 
     fn missing_glyph(grapheme: &'static str) -> MissingGlyph {

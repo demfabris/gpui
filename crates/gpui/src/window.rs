@@ -557,7 +557,26 @@ impl ArenaClearNeeded {
     }
 }
 
-pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
+#[derive(Default)]
+pub(crate) struct FocusMap {
+    slots: RwLock<SlotMap<FocusId, FocusRef>>,
+    released: AtomicBool,
+}
+
+impl FocusMap {
+    pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, SlotMap<FocusId, FocusRef>> {
+        self.slots.read()
+    }
+
+    pub(crate) fn write(&self) -> parking_lot::RwLockWriteGuard<'_, SlotMap<FocusId, FocusRef>> {
+        self.slots.write()
+    }
+
+    pub(crate) fn take_released(&self) -> bool {
+        self.released.swap(false, SeqCst)
+    }
+}
+
 pub(crate) struct FocusRef {
     pub(crate) ref_count: AtomicUsize,
     pub(crate) tab_index: isize,
@@ -723,12 +742,16 @@ impl Eq for FocusHandle {}
 
 impl Drop for FocusHandle {
     fn drop(&mut self) {
-        self.handles
+        let previous_count = self
+            .handles
             .read()
             .get(self.id)
             .unwrap()
             .ref_count
             .fetch_sub(1, SeqCst);
+        if previous_count == 1 {
+            self.handles.released.store(true, SeqCst);
+        }
     }
 }
 
