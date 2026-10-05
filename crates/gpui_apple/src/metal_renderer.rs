@@ -461,16 +461,30 @@ impl MetalRenderer {
                 ];
             }
         }
-        self.update_path_intermediate_textures(size);
+        if self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| !texture_has_size(texture, size))
+        {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+        }
     }
 
-    fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+    fn ensure_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
+            return;
+        }
+        if self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| texture_has_size(texture, size))
+        {
             return;
         }
 
@@ -656,9 +670,6 @@ impl MetalRenderer {
         // Headless callers do not have a Cocoa event-loop pool to release
         // autoreleased command buffers and render-pass descriptors.
         objc2::rc::autoreleasepool(|_| {
-            // Update path intermediate textures for this size
-            self.update_path_intermediate_textures(size);
-
             // Create an offscreen texture as render target
             let texture_descriptor = metal::TextureDescriptor::new();
             texture_descriptor.set_width(size.width.0 as u64);
@@ -703,8 +714,6 @@ impl MetalRenderer {
         }
 
         objc2::rc::autoreleasepool(|_| {
-            self.update_path_intermediate_textures(size);
-
             let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
                 texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
             });
@@ -1037,7 +1046,7 @@ impl MetalRenderer {
     }
 
     fn draw_paths_to_intermediate(
-        &self,
+        &mut self,
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
@@ -1046,6 +1055,7 @@ impl MetalRenderer {
         if paths.is_empty() {
             return Ok(false);
         }
+        self.ensure_path_intermediate_textures(viewport_size);
         let intermediate_texture = self
             .path_intermediate_texture
             .as_ref()
@@ -2213,9 +2223,9 @@ mod tests {
         objc::rc::autoreleasepool(|| {
             let target = small_target(&renderer);
             let error = renderer
-                .render_frame(&scene, &target, size(16.into(), 16.into()))
+                .render_frame(&scene, &target, size(16.into(), 0.into()))
                 .err()
-                .expect("headless path target was not initialized");
+                .expect("a zero-height viewport has no path target");
             assert!(
                 error
                     .to_string()
@@ -2261,6 +2271,131 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(atlas.upgrade().is_none());
+        Ok(())
+    }
+
+    fn red_triangle(extent: f32) -> Path<ScaledPixels> {
+        let mut path = Path::new(point(px(0.0), px(0.0)));
+        path.line_to(point(px(extent), px(0.0)));
+        path.line_to(point(px(0.0), px(extent)));
+        path.content_mask.bounds =
+            Bounds::new(point(px(0.0), px(0.0)), size(px(extent), px(extent)));
+        path.color = hsla(0.0, 1.0, 0.5, 1.0).into();
+        path.scale(1.0)
+    }
+
+    fn triangle_scene() -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(red_triangle(32.0));
+        scene.finish();
+        scene
+    }
+
+    fn quad_scene() -> Scene {
+        let mut scene = Scene::default();
+        let bounds = Bounds::new(point(px(8.0), px(8.0)), size(px(16.0), px(16.0))).scale(1.0);
+        scene.insert_primitive(solid_quad(bounds, hsla(0.6, 1.0, 0.5, 1.0)));
+        scene.finish();
+        scene
+    }
+
+    fn path_texture_size(renderer: &MetalRenderer) -> Option<(u64, u64)> {
+        let texture = renderer.path_intermediate_texture.as_ref()?;
+        let msaa = renderer.path_intermediate_msaa_texture.as_ref()?;
+        assert_eq!(
+            (msaa.width(), msaa.height()),
+            (texture.width(), texture.height())
+        );
+        Some((texture.width(), texture.height()))
+    }
+
+    #[test]
+    fn path_textures_wait_for_a_frame_with_paths() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let window = size(64.into(), 64.into());
+        renderer.update_drawable_size(window);
+        assert_eq!(path_texture_size(&renderer), None);
+        renderer.render_scene_to_image(&quad_scene(), window)?;
+        assert_eq!(path_texture_size(&renderer), None);
+        renderer.render_scene_to_image(&triangle_scene(), window)?;
+        assert_eq!(path_texture_size(&renderer), Some((64, 64)));
+        renderer.update_drawable_size(window);
+        assert_eq!(path_texture_size(&renderer), Some((64, 64)));
+        renderer.update_drawable_size(size(96.into(), 48.into()));
+        assert_eq!(path_texture_size(&renderer), None);
+        Ok(())
+    }
+
+    #[test]
+    fn layer_frames_allocate_path_textures_at_the_drawable_size() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())), false);
+        renderer.update_drawable_size(size(64.into(), 64.into()));
+        renderer.render_to_image(&quad_scene())?;
+        assert_eq!(path_texture_size(&renderer), None);
+        renderer.update_drawable_size(size(96.into(), 48.into()));
+        let image = renderer.render_to_image(&triangle_scene())?;
+        assert_eq!(path_texture_size(&renderer), Some((96, 48)));
+        assert_eq!(image.dimensions(), (96, 48));
+        assert_eq!(image.get_pixel(4, 4).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(40, 40).0, [0, 0, 0, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn paths_render_after_resize_and_frames_without_paths() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let first = size(64.into(), 64.into());
+        let resized = size(96.into(), 48.into());
+        renderer.update_drawable_size(first);
+        let before = renderer.render_scene_to_image(&triangle_scene(), first)?;
+        renderer.update_drawable_size(resized);
+        renderer.render_scene_to_image(&quad_scene(), resized)?;
+        let after = renderer.render_scene_to_image(&triangle_scene(), resized)?;
+        let reference =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))
+                .render_scene_to_image(&triangle_scene(), resized)?;
+
+        assert_eq!(before.get_pixel(4, 4).0, [255, 0, 0, 255]);
+        assert_eq!(before.get_pixel(40, 40).0, [0, 0, 0, 255]);
+        assert_eq!(after.get_pixel(4, 4).0, [255, 0, 0, 255]);
+        assert_eq!(after.get_pixel(40, 40).0, [0, 0, 0, 255]);
+        assert_eq!(after.get_pixel(20, 20).0, [0, 0, 0, 255]);
+        assert!(
+            after == reference,
+            "resized path frame differs from a fresh renderer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn paths_inside_shader_layers_get_path_textures() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let window = size(64.into(), 64.into());
+        renderer.update_drawable_size(window);
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(64.0), px(64.0))).scale(1.0);
+        let mut layer_scene = Scene::default();
+        layer_scene.insert_primitive(red_triangle(32.0));
+        layer_scene.finish();
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(bounds, hsla(0.0, 0.0, 0.0, 1.0)));
+        scene.insert_primitive(ShaderLayer {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            shader: CustomShader::new("not wgsl".to_owned()),
+            uniforms: Arc::from([]),
+            scene: std::rc::Rc::new(layer_scene),
+        });
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, window)?;
+        assert_eq!(image.get_pixel(4, 4).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(40, 40).0, [0, 0, 0, 255]);
+        assert_eq!(path_texture_size(&renderer), Some((64, 64)));
         Ok(())
     }
 
