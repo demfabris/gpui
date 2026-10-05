@@ -6074,6 +6074,7 @@ impl Window {
                 PlatformInput::MousePressure(mouse_pressure)
             }
             PlatformInput::MouseExited(mouse_exited) => {
+                self.mouse_position = mouse_exited.position;
                 self.modifiers = mouse_exited.modifiers;
                 PlatformInput::MouseExited(mouse_exited)
             }
@@ -8755,6 +8756,53 @@ mod tests {
         test_window.simulate_scale_factor_change(1.0);
         assert_eq!(bounds_events.get(), 5);
         assert_eq!(renders.get(), rendered + 3);
+    }
+
+    #[gpui::test]
+    fn mouse_exit_clears_hover_on_the_next_frame(cx: &mut TestAppContext) {
+        struct HoverView;
+
+        impl Render for HoverView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(
+                    div()
+                        .id("target")
+                        .size(px(50.))
+                        .bg(crate::blue())
+                        .hover(|style| style.bg(crate::red())),
+                )
+            }
+        }
+
+        let window = cx.add_window(|_, _| HoverView);
+        let hovered = |window: &Window| {
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .any(|quad| quad.background.solid == crate::red())
+        };
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_mouse_move(point(px(10.), px(10.)), cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(hovered(window));
+
+            window.dispatch_event(
+                crate::MouseExitEvent {
+                    position: point(px(10.), px(-5.)),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(!hovered(window));
+            assert_eq!(window.mouse_position(), point(px(10.), px(-5.)));
+        })
+        .unwrap();
     }
 
     struct EmptyView;
