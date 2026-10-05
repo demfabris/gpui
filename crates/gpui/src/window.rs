@@ -2786,11 +2786,16 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
+        let previous_metrics = (self.scale_factor, self.viewport_size, self.display_id);
         self.sync_platform_metrics();
         self.display_id = self.platform_window.display().map(|display| display.id());
         self.mouse_position = self.platform_window.mouse_position() / self.zoom;
 
-        self.refresh();
+        if previous_metrics != (self.scale_factor, self.viewport_size, self.display_id)
+            || self.rendered_frame.hit_test(self.mouse_position) != self.mouse_hit_test
+        {
+            self.refresh();
+        }
 
         self.bounds_observers
             .clone()
@@ -8675,6 +8680,81 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    struct WindowMoveView {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for WindowMoveView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    div()
+                        .id("left")
+                        .w(px(100.))
+                        .h_full()
+                        .hover(|style| style.bg(crate::red())),
+                )
+                .child(
+                    div()
+                        .id("right")
+                        .w(px(100.))
+                        .h_full()
+                        .hover(|style| style.bg(crate::blue())),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn window_moves_redraw_only_when_metrics_or_hovered_hitboxes_change(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let renders = renders.clone();
+            move |_, _| WindowMoveView { renders }
+        });
+        let bounds_events = Rc::new(Cell::new(0));
+        window
+            .update(cx, |_, window, cx| {
+                let bounds_events = bounds_events.clone();
+                cx.observe_window_bounds(window, move |_, _, _| {
+                    bounds_events.set(bounds_events.get() + 1)
+                })
+                .detach();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let mut test_window = cx.test_window(window.into());
+        let rendered = renders.get();
+
+        test_window.simulate_move(point(px(40.), px(30.)), point(px(10.), px(10.)));
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(window.bounds().origin, point(px(40.), px(30.)));
+                assert_eq!(window.mouse_position(), point(px(10.), px(10.)));
+            })
+            .unwrap();
+        assert_eq!(bounds_events.get(), 1);
+        assert_eq!(renders.get(), rendered);
+
+        test_window.simulate_move(point(px(20.), px(30.)), point(px(150.), px(10.)));
+        assert_eq!(bounds_events.get(), 2);
+        assert_eq!(renders.get(), rendered + 1);
+
+        test_window.simulate_resize(size(px(300.), px(200.)));
+        assert_eq!(bounds_events.get(), 3);
+        assert_eq!(renders.get(), rendered + 2);
+
+        test_window.simulate_resize(size(px(300.), px(200.)));
+        assert_eq!(bounds_events.get(), 4);
+        assert_eq!(renders.get(), rendered + 2);
+
+        test_window.simulate_scale_factor_change(1.0);
+        assert_eq!(bounds_events.get(), 5);
+        assert_eq!(renders.get(), rendered + 3);
     }
 
     struct EmptyView;
