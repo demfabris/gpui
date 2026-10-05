@@ -12,7 +12,7 @@ use std::{
     },
 };
 
-use super::{LineWrapper, recent_shapes::RecentShapes};
+use super::{LineWrapper, number_shaping::NumberShaping, recent_shapes::RecentShapes};
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -475,6 +475,7 @@ pub(crate) struct LineLayoutCache {
     /// Records the generation represented by both frame caches.
     cached_font_generation: AtomicUsize,
     recent_shapes: Mutex<RecentShapes>,
+    numbers: Mutex<NumberShaping>,
 }
 
 #[derive(Default)]
@@ -518,6 +519,7 @@ impl LineLayoutCache {
             font_generation,
             cached_font_generation: AtomicUsize::new(cached_font_generation),
             recent_shapes: Mutex::default(),
+            numbers: Mutex::default(),
         }
     }
 
@@ -917,7 +919,15 @@ impl LineLayoutCache {
         {
             return layout;
         }
-        let layout = self.platform_text_system.layout_line(text, font_size, runs);
+        let number = self.numbers.lock().shape(
+            &*self.platform_text_system,
+            font_generation,
+            text,
+            font_size,
+            runs,
+        );
+        let layout =
+            number.unwrap_or_else(|| self.platform_text_system.layout_line(text, font_size, runs));
         if self.font_generation.load(Ordering::Acquire) == font_generation {
             self.recent_shapes
                 .lock()
@@ -940,6 +950,7 @@ impl LineLayoutCache {
         *current_frame = FrameCache::default();
         *self.previous_frame.lock() = FrameCache::default();
         *self.recent_shapes.lock() = RecentShapes::default();
+        *self.numbers.lock() = NumberShaping::default();
         self.cached_font_generation
             .store(font_generation, Ordering::Release);
         font_generation

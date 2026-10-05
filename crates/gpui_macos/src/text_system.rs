@@ -824,7 +824,367 @@ mod lenient_font_attributes {
 mod tests {
     use super::{synthetic_bold_device_line_width, synthetic_bold_user_space_line_width};
     use crate::MacTextSystem;
-    use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+    use gpui::{
+        Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, GlyphId, Hsla,
+        LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, Result, SharedString, Size,
+        TextRenderingMode, TextRun, TextSystem, WindowTextSystem, font, px,
+    };
+    use std::{
+        borrow::Cow,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
+
+    struct CountingTextSystem {
+        inner: Arc<MacTextSystem>,
+        lines: AtomicUsize,
+    }
+
+    impl PlatformTextSystem for CountingTextSystem {
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            self.inner.add_fonts(fonts)
+        }
+
+        fn all_font_names(&self) -> Vec<String> {
+            self.inner.all_font_names()
+        }
+
+        fn font_id(&self, font: &Font) -> Result<FontId> {
+            self.inner.font_id(font)
+        }
+
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            self.inner.font_metrics(font_id)
+        }
+
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            self.inner.typographic_bounds(font_id, glyph_id)
+        }
+
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            self.inner.advance(font_id, glyph_id)
+        }
+
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            self.inner.glyph_for_char(font_id, ch)
+        }
+
+        fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            self.inner.glyph_raster_bounds(params)
+        }
+
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            self.inner.rasterize_glyph(params, raster_bounds)
+        }
+
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.lines.fetch_add(1, Ordering::Relaxed);
+            self.inner.layout_line(text, font_size, runs)
+        }
+
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
+            self.inner.recommended_rendering_mode(font_id, font_size)
+        }
+
+        fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+            self.inner.glyph_dilation_for_color(color)
+        }
+    }
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+
+        fn digits(&mut self, count: u64) -> String {
+            (0..count)
+                .map(|_| char::from(b'0' + self.below(10) as u8))
+                .collect()
+        }
+
+        fn grouped(&mut self) -> String {
+            let mut text = (1 + self.below(999)).to_string();
+            for _ in 0..self.below(4) {
+                text.push(',');
+                text.push_str(&self.digits(3));
+            }
+            text
+        }
+
+        fn number(&mut self) -> String {
+            let sign = ["", "+", "-"][self.below(3) as usize];
+            match self.below(6) {
+                0 => {
+                    let count = 1 + self.below(12);
+                    self.digits(count)
+                }
+                1 => {
+                    let count = 1 + self.below(5);
+                    format!("{sign}{}.{}", self.digits(count), self.digits(2))
+                }
+                2 => format!("{}.{}", self.grouped(), self.digits(2)),
+                3 => format!("{sign}{}.{}%", self.below(1000), self.digits(2)),
+                4 => format!("{sign}${}", self.grouped()),
+                _ => format!(
+                    "{}.{}{}",
+                    1 + self.below(999),
+                    self.digits(1),
+                    ["K", "M", "B", "T"][self.below(4) as usize]
+                ),
+            }
+        }
+
+        fn anything(&mut self) -> String {
+            const CHARACTERS: &[u8] = b"0123456789.,+-%$KMBT";
+            let pick = |random: &mut Self| {
+                char::from(CHARACTERS[random.below(CHARACTERS.len() as u64) as usize])
+            };
+            match self.below(3) {
+                0 => self.number(),
+                1 => (0..1 + self.below(16)).map(|_| pick(self)).collect(),
+                _ => {
+                    let character = pick(self);
+                    let repeated = character.to_string().repeat(2 + self.below(7) as usize);
+                    let (before, after) = (self.below(3), self.below(3));
+                    format!("{}{repeated}{}", self.digits(before), self.digits(after))
+                }
+            }
+        }
+    }
+
+    fn largest_difference(ours: &LineLayout, theirs: &LineLayout, text: &str) -> f32 {
+        let shape = |layout: &LineLayout| {
+            (
+                layout.len,
+                layout.font_size,
+                layout.ascent,
+                layout.descent,
+                layout
+                    .runs
+                    .iter()
+                    .map(|run| {
+                        (
+                            run.font_id,
+                            run.glyphs
+                                .iter()
+                                .map(|glyph| (glyph.id, glyph.index, glyph.is_emoji))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(shape(ours), shape(theirs), "{text:?}");
+        ours.runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .zip(theirs.runs.iter().flat_map(|run| &run.glyphs))
+            .map(|(ours, theirs)| {
+                f32::from(ours.position.x - theirs.position.x)
+                    .abs()
+                    .max(f32::from(ours.position.y - theirs.position.y).abs())
+            })
+            .fold(f32::from(ours.width - theirs.width).abs(), f32::max)
+    }
+
+    #[test]
+    fn numbers_put_together_match_core_text() {
+        const LINES: usize = 240;
+        const PROBES: usize = 50;
+        let mac = Arc::new(MacTextSystem::new());
+        mac.add_fonts(vec![
+            Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/lilex/Lilex-Regular.ttf"
+            )),
+            Cow::Borrowed(include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf")),
+            Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+            )),
+        ])
+        .unwrap();
+        let counting = Arc::new(CountingTextSystem {
+            inner: mac.clone(),
+            lines: AtomicUsize::new(0),
+        });
+        let text_system = Arc::new(TextSystem::new(counting.clone()));
+        let with_features = |family: &str, features: &[(&str, u32)]| Font {
+            features: FontFeatures(Arc::new(
+                features
+                    .iter()
+                    .map(|(tag, value)| (tag.to_string(), *value))
+                    .collect(),
+            )),
+            ..font(family.to_string())
+        };
+        let zz_fonts = [
+            (".SystemUIFont", font(".SystemUIFont")),
+            (".SystemUIFont bold", font(".SystemUIFont").bold()),
+            (
+                ".SystemUIFont tnum",
+                with_features(".SystemUIFont", &[("tnum", 1)]),
+            ),
+            ("Menlo", font("Menlo")),
+            ("Menlo bold", font("Menlo").bold()),
+            ("Menlo calt=0", with_features("Menlo", &[("calt", 0)])),
+            ("Lilex", font("Lilex")),
+            ("Lilex bold", font("Lilex").bold()),
+        ];
+        let other_fonts = [
+            ("Lilex liga=0", with_features("Lilex", &[("liga", 0)])),
+            ("IBM Plex Sans", font("IBM Plex Sans")),
+            ("Monaco", font("Monaco")),
+            ("Helvetica", font("Helvetica")),
+            ("Helvetica Neue", font("Helvetica Neue")),
+            (
+                "Helvetica Neue tnum",
+                with_features("Helvetica Neue", &[("tnum", 1)]),
+            ),
+            ("Arial", font("Arial")),
+            ("Times New Roman", font("Times New Roman")),
+            ("Georgia", font("Georgia")),
+            ("Avenir Next", font("Avenir Next")),
+            ("Futura", font("Futura")),
+            ("Courier New", font("Courier New")),
+            ("Verdana", font("Verdana")),
+            ("PingFang SC", font("PingFang SC")),
+            ("Lucida Grande", font("Lucida Grande")),
+            ("Geneva", font("Geneva")),
+        ];
+        let sizes = [9.0, 11.0, 12.0, 13.0, 13.6, 16.0, 20.0, 24.0, 32.0];
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        let mut put_together_everywhere = Vec::new();
+        for (zz, (name, font)) in zz_fonts
+            .iter()
+            .map(|font| (true, font))
+            .chain(other_fonts.iter().map(|font| (false, font)))
+        {
+            if mac.font_id(font).is_err() {
+                println!("{name}: not installed");
+                continue;
+            }
+            let font_id = text_system.resolve_font(font);
+            let mut probe_calls = [0; 2];
+            let mut largest = 0f32;
+            for size in sizes {
+                let font_size = px(size);
+                for (phase, numbers_only) in [true, false].into_iter().enumerate() {
+                    let system = WindowTextSystem::new(text_system.clone());
+                    let lines = (0..LINES).map(|_| {
+                        if numbers_only {
+                            random.number()
+                        } else {
+                            random.anything()
+                        }
+                    });
+                    let probes = (0..PROBES).map(|probe| (10_000_000 + probe * 7919).to_string());
+                    for (line, text) in lines.chain(probes).enumerate() {
+                        let before = counting.lines.load(Ordering::Relaxed);
+                        let ours = system.layout_line(
+                            &text,
+                            font_size,
+                            &[TextRun {
+                                len: text.len(),
+                                font: font.clone(),
+                                ..TextRun::default()
+                            }],
+                            None,
+                        );
+                        if line >= LINES {
+                            probe_calls[phase] += counting.lines.load(Ordering::Relaxed) - before;
+                        }
+                        let theirs = mac.layout_line(
+                            &text,
+                            font_size,
+                            &[FontRun {
+                                len: text.len(),
+                                font_id,
+                            }],
+                        );
+                        let difference = largest_difference(&ours, &theirs, &text);
+                        assert!(
+                            difference <= 1e-3,
+                            "{name} at {size}: {text:?} is {difference} px off"
+                        );
+                        largest = largest.max(difference);
+                    }
+                }
+            }
+            let [numbers, anything] =
+                probe_calls.map(|calls| calls as f32 / (PROBES * sizes.len()) as f32);
+            println!(
+                "{name}: platform calls per new number after {LINES} numbers {numbers:.3}, \
+                 after {LINES} lines of any of the characters {anything:.3}; \
+                 largest difference {largest:e} px"
+            );
+            if zz {
+                put_together_everywhere.push((*name, numbers));
+            }
+        }
+        for (name, calls) in put_together_everywhere {
+            assert!(calls < 0.1, "{name} numbers are left to the platform");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn number_lines_shaping_cost() {
+        const RUNS: usize = 11;
+        const WARMUP: usize = 64;
+        const LINES: usize = 4000;
+        let streams: [(&str, fn(usize) -> String); 5] = [
+            ("counter", |i| (1_000_000 + i * 13).to_string()),
+            ("size", |i| format!("{}.{}K", 1 + i / 10, i % 10)),
+            ("percent", |i| format!("+{}.{:02}%", i / 100, i % 100)),
+            ("clock", |i| {
+                format!("{:02}:{:02}:{:02}", i / 3600 % 24, i / 60 % 60, i % 60)
+            }),
+            ("words", |i| format!("pane {i}")),
+        ];
+        let families = [(".SystemUIFont", 13.0), ("Menlo", 13.0)];
+        let platform = Arc::new(MacTextSystem::new());
+        for run in 0..RUNS {
+            for (family, size) in families {
+                for (name, stream) in streams {
+                    let system = WindowTextSystem::new(Arc::new(TextSystem::new(platform.clone())));
+                    let text_run = |len| TextRun {
+                        len,
+                        font: font(family),
+                        ..TextRun::default()
+                    };
+                    for i in 0..WARMUP {
+                        let text = SharedString::from(stream(i));
+                        system.shape_line(text.clone(), px(size), &[text_run(text.len())], None);
+                    }
+                    let lines = (WARMUP..WARMUP + LINES)
+                        .map(|i| SharedString::from(stream(i)))
+                        .collect::<Vec<_>>();
+                    let started = Instant::now();
+                    for text in lines {
+                        let len = text.len();
+                        system.shape_line(text, px(size), &[text_run(len)], None);
+                    }
+                    let nanos = started.elapsed().as_nanos() / LINES as u128;
+                    println!("bench {family} {name} {run} {nanos}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn lines_laid_out_with_kept_fonts_match_the_first_layout() {

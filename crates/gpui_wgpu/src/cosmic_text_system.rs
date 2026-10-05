@@ -1862,4 +1862,287 @@ mod tests {
         let spans = compute_run_spans("anything", 3, 0, primary, &fb, &covers);
         assert!(spans.is_empty());
     }
+
+    struct CountingTextSystem {
+        inner: Arc<CosmicTextSystem>,
+        lines: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PlatformTextSystem for CountingTextSystem {
+        fn font_generation(&self) -> u64 {
+            self.inner.font_generation()
+        }
+
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            self.inner.add_fonts(fonts)
+        }
+
+        fn set_missing_glyph_sink(&self, sink: Option<Arc<dyn MissingGlyphSink>>) {
+            self.inner.set_missing_glyph_sink(sink)
+        }
+
+        fn all_font_names(&self) -> Vec<String> {
+            self.inner.all_font_names()
+        }
+
+        fn font_id(&self, font: &Font) -> Result<FontId> {
+            self.inner.font_id(font)
+        }
+
+        fn prewarm_fonts(&self, font_ids: &[FontId]) {
+            self.inner.prewarm_fonts(font_ids)
+        }
+
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            self.inner.font_metrics(font_id)
+        }
+
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            self.inner.typographic_bounds(font_id, glyph_id)
+        }
+
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            self.inner.advance(font_id, glyph_id)
+        }
+
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            self.inner.glyph_for_char(font_id, ch)
+        }
+
+        fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            self.inner.glyph_raster_bounds(params)
+        }
+
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            self.inner.rasterize_glyph(params, raster_bounds)
+        }
+
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.lines.fetch_add(1, Ordering::Relaxed);
+            self.inner.layout_line(text, font_size, runs)
+        }
+
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
+            self.inner.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    fn line_shape(layout: &LineLayout) -> impl PartialEq + std::fmt::Debug {
+        (
+            layout.len,
+            layout.font_size,
+            layout.ascent,
+            layout.descent,
+            layout
+                .runs
+                .iter()
+                .map(|run| {
+                    (
+                        run.font_id,
+                        run.glyphs
+                            .iter()
+                            .map(|glyph| (glyph.id, glyph.index, glyph.is_emoji))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn numbers_put_together_match_cosmic_text() -> Result<()> {
+        const LINES: usize = 240;
+        const PROBES: usize = 50;
+        const CHARACTERS: &[u8] = b"0123456789.,+-%$KMBT";
+        let platform = Arc::new(CosmicTextSystem::new_without_system_fonts("IBM Plex Sans"));
+        platform.add_fonts(vec![
+            Cow::Borrowed(LILEX),
+            Cow::Borrowed(include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf")),
+            Cow::Borrowed(IBM_PLEX),
+            Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"
+            )),
+        ])?;
+        let counting = Arc::new(CountingTextSystem {
+            inner: platform.clone(),
+            lines: Default::default(),
+        });
+        let text_system = Arc::new(gpui::TextSystem::new(counting.clone()));
+        let with_features = |family: &str, features: &[(&str, u32)]| Font {
+            features: FontFeatures(Arc::new(
+                features
+                    .iter()
+                    .map(|(tag, value)| (tag.to_string(), *value))
+                    .collect(),
+            )),
+            ..gpui::font(family.to_string())
+        };
+        let fonts = [
+            ("Lilex", gpui::font("Lilex")),
+            ("Lilex bold", gpui::font("Lilex").bold()),
+            ("Lilex liga=0", with_features("Lilex", &[("liga", 0)])),
+            ("IBM Plex Sans", gpui::font("IBM Plex Sans")),
+            (
+                "IBM Plex Sans semibold",
+                Font {
+                    weight: gpui::FontWeight::SEMIBOLD,
+                    ..gpui::font("IBM Plex Sans")
+                },
+            ),
+            (
+                "IBM Plex Sans tnum",
+                with_features("IBM Plex Sans", &[("tnum", 1)]),
+            ),
+        ];
+        let sizes = [9.0, 11.0, 12.0, 13.0, 13.6, 16.0, 20.0, 24.0, 32.0];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut below = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let mut line = |numbers_only: bool| -> String {
+            let length = 1 + below(16) as usize;
+            if numbers_only {
+                let digits: String = (0..length)
+                    .map(|_| char::from(b'0' + below(10) as u8))
+                    .collect();
+                match below(4) {
+                    0 => digits,
+                    1 => format!("{digits}.{}", below(100)),
+                    2 => format!("-{digits}%"),
+                    _ => format!("{}.{}K", below(1000), below(10)),
+                }
+            } else if below(2) == 0 {
+                (0..length)
+                    .map(|_| char::from(CHARACTERS[below(CHARACTERS.len() as u64) as usize]))
+                    .collect()
+            } else {
+                let repeated = char::from(CHARACTERS[below(CHARACTERS.len() as u64) as usize]);
+                format!("1{}2", repeated.to_string().repeat(2 + below(7) as usize))
+            }
+        };
+        for (name, font) in fonts {
+            let font_id = text_system.resolve_font(&font);
+            let mut probe_calls = 0;
+            let mut largest = 0f32;
+            for size in sizes {
+                let font_size = gpui::px(size);
+                for numbers_only in [true, false] {
+                    let system = gpui::WindowTextSystem::new(text_system.clone());
+                    let lines = (0..LINES).map(|_| line(numbers_only)).collect::<Vec<_>>();
+                    let probes = (0..PROBES).map(|probe| (10_000_000 + probe * 7919).to_string());
+                    for (index, text) in lines.into_iter().chain(probes).enumerate() {
+                        let before = counting.lines.load(Ordering::Relaxed);
+                        let ours = system.layout_line(
+                            &text,
+                            font_size,
+                            &[gpui::TextRun {
+                                len: text.len(),
+                                font: font.clone(),
+                                ..gpui::TextRun::default()
+                            }],
+                            None,
+                        );
+                        if numbers_only && index >= LINES {
+                            probe_calls += counting.lines.load(Ordering::Relaxed) - before;
+                        }
+                        let theirs = platform.layout_line(
+                            &text,
+                            font_size,
+                            &[FontRun {
+                                len: text.len(),
+                                font_id,
+                            }],
+                        );
+                        assert_eq!(line_shape(&ours), line_shape(&theirs), "{name} {text:?}");
+                        let difference = ours
+                            .runs
+                            .iter()
+                            .flat_map(|run| &run.glyphs)
+                            .zip(theirs.runs.iter().flat_map(|run| &run.glyphs))
+                            .map(|(ours, theirs)| {
+                                f32::from(ours.position.x - theirs.position.x)
+                                    .abs()
+                                    .max(f32::from(ours.position.y - theirs.position.y).abs())
+                            })
+                            .fold(f32::from(ours.width - theirs.width).abs(), f32::max);
+                        assert!(
+                            difference <= 1e-3,
+                            "{name} at {size}: {text:?} is {difference} px off"
+                        );
+                        largest = largest.max(difference);
+                    }
+                }
+            }
+            let calls = probe_calls as f32 / (PROBES * sizes.len()) as f32;
+            println!(
+                "{name}: platform calls per new number {calls:.3}, largest difference {largest:e} px"
+            );
+            assert!(calls < 0.1, "{name} numbers are left to the platform");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn number_lines_shaping_cost() -> Result<()> {
+        const RUNS: usize = 11;
+        const WARMUP: usize = 64;
+        const LINES: usize = 4000;
+        let streams: [(&str, fn(usize) -> String); 5] = [
+            ("counter", |i| (1_000_000 + i * 13).to_string()),
+            ("size", |i| format!("{}.{}K", 1 + i / 10, i % 10)),
+            ("percent", |i| format!("+{}.{:02}%", i / 100, i % 100)),
+            ("clock", |i| {
+                format!("{:02}:{:02}:{:02}", i / 3600 % 24, i / 60 % 60, i % 60)
+            }),
+            ("words", |i| format!("pane {i}")),
+        ];
+        let platform = Arc::new(CosmicTextSystem::new_without_system_fonts("IBM Plex Sans"));
+        platform.add_fonts(vec![Cow::Borrowed(LILEX), Cow::Borrowed(IBM_PLEX)])?;
+        for run in 0..RUNS {
+            for family in ["IBM Plex Sans", "Lilex"] {
+                for (name, stream) in streams {
+                    let system = gpui::WindowTextSystem::new(Arc::new(gpui::TextSystem::new(
+                        platform.clone(),
+                    )));
+                    let text_run = |len| gpui::TextRun {
+                        len,
+                        font: gpui::font(family),
+                        ..gpui::TextRun::default()
+                    };
+                    for i in 0..WARMUP {
+                        let text = SharedString::from(stream(i));
+                        system.shape_line(
+                            text.clone(),
+                            gpui::px(13.),
+                            &[text_run(text.len())],
+                            None,
+                        );
+                    }
+                    let lines = (WARMUP..WARMUP + LINES)
+                        .map(|i| SharedString::from(stream(i)))
+                        .collect::<Vec<_>>();
+                    let started = std::time::Instant::now();
+                    for text in lines {
+                        let len = text.len();
+                        system.shape_line(text, gpui::px(13.), &[text_run(len)], None);
+                    }
+                    let nanos = started.elapsed().as_nanos() / LINES as u128;
+                    println!("bench {} {name} {run} {nanos}", family.replace(' ', "_"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
