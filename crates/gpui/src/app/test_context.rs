@@ -462,6 +462,13 @@ impl TestAppContext {
         self.test_window(window_handle).simulate_resize(size);
     }
 
+    /// Simulates the window moving to a new origin without changing its size.
+    pub fn simulate_window_move(&self, window_handle: AnyWindowHandle, origin: Point<Pixels>) {
+        let mut test_window = self.test_window(window_handle);
+        let mouse_position = crate::PlatformWindow::mouse_position(&test_window);
+        test_window.simulate_move(origin, mouse_position);
+    }
+
     /// Simulates a change in whether the platform is presenting the window.
     pub fn simulate_window_visibility_change(
         &self,
@@ -971,6 +978,11 @@ impl VisualTestContext {
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_resize(&self, size: Size<Pixels>) {
         self.simulate_window_resize(self.window, size)
+    }
+
+    /// Simulates the user moving the window to a new origin.
+    pub fn simulate_move(&self, origin: Point<Pixels>) {
+        self.simulate_window_move(self.window, origin)
     }
 
     /// Simulates a change in whether the platform is presenting this window.
