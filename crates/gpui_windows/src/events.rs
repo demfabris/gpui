@@ -151,7 +151,7 @@ impl WindowsWindowInner {
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
             WM_SYSKEYUP => self.handle_syskeyup_msg(wparam, lparam),
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
-            WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
+            WM_GPUI_KEYDOWN => self.handle_keydown_msg(handle, wparam, lparam),
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
@@ -433,7 +433,7 @@ impl WindowsWindowInner {
 
     // It's a known bug that you can't trigger `ctrl-shift-0`. See:
     // https://superuser.com/questions/1455762/ctrl-shift-number-key-combination-has-stopped-working-for-a-few-numbers
-    fn handle_keydown_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+    fn handle_keydown_msg(&self, handle: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         let Some(input) = handle_key_event(
             wparam,
             lparam,
@@ -456,6 +456,7 @@ impl WindowsWindowInner {
         let handled = !func(input).propagate;
 
         self.state.callbacks.input.set(Some(func));
+        self.update_ime_enabled(handle);
 
         if handled { Some(0) } else { Some(1) }
     }
@@ -700,9 +701,7 @@ impl WindowsWindowInner {
     }
 
     fn update_ime_enabled(&self, handle: HWND) {
-        let ime_enabled = self
-            .with_input_handler(|input_handler| input_handler.query_accepts_text_input())
-            .unwrap_or(false);
+        let ime_enabled = self.with_input_handler(ime_enabled_for).unwrap_or(false);
         if ime_enabled == self.state.ime_enabled.get() {
             return;
         }
@@ -1462,6 +1461,10 @@ impl WindowsWindowInner {
     }
 }
 
+fn ime_enabled_for(input_handler: &mut PlatformInputHandler) -> bool {
+    input_handler.query_prefers_ime_for_printable_keys()
+}
+
 struct ImeContext {
     hwnd: HWND,
     himc: HIMC,
@@ -1805,5 +1808,104 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+
+    use gpui::{
+        App, Bounds, KeyBinding, Pixels, PlatformInputHandler, TestAppContext, UTF16Selection,
+        Window, actions,
+    };
+
+    use super::ime_enabled_for;
+
+    actions!(ime_test, [ChordAction]);
+
+    struct TextField;
+
+    impl gpui::InputHandler for TextField {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            None
+        }
+
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+
+        fn text_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            None
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _: gpui::Point<Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            None
+        }
+
+        fn prefers_ime_for_printable_keys(&mut self, _: &mut Window, _: &mut App) -> bool {
+            true
+        }
+    }
+
+    #[gpui::test]
+    fn ime_stays_off_until_a_prefix_chord_gets_its_next_key(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-k m", ChordAction, None)]));
+        let cx = cx.add_empty_window();
+        let mut input_handler = cx.update(|window, cx| {
+            PlatformInputHandler::new(window.to_async(cx), Box::new(TextField))
+        });
+
+        assert!(ime_enabled_for(&mut input_handler));
+        cx.simulate_keystrokes("ctrl-k");
+        assert!(!ime_enabled_for(&mut input_handler));
+        cx.simulate_keystrokes("m");
+        assert!(ime_enabled_for(&mut input_handler));
     }
 }
