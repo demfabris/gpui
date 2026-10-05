@@ -3226,7 +3226,10 @@ where
         device_id_override.as_deref(),
         reject_software,
         |backends, reject_software| {
-            let instance = WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
+            let instance =
+                without_software_vulkan_drivers(backends == wgpu::Backends::VULKAN, || {
+                    WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends)
+                });
             let surface = create_surface(&instance, raw_window_handle)?;
             let context = if reject_software {
                 WgpuContext::new_rejecting_software(instance, &surface, compositor_gpu)?
@@ -3242,6 +3245,38 @@ where
             Ok((context, surface))
         },
     )
+}
+
+#[cfg(target_os = "linux")]
+const SOFTWARE_VULKAN_DRIVERS: &str = "*lvp*,*lavapipe*,*llvmpipe*,*swrast*,*swiftshader*";
+
+#[cfg(target_os = "linux")]
+const VULKAN_DRIVER_OVERRIDES: [&str; 5] = [
+    "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
+    "VK_ADD_DRIVER_FILES",
+    "VK_LOADER_DRIVERS_DISABLE",
+    "VK_LOADER_DRIVERS_SELECT",
+];
+
+#[cfg(target_os = "linux")]
+fn without_software_vulkan_drivers<T>(hardware_only: bool, create: impl FnOnce() -> T) -> T {
+    if !hardware_only
+        || VULKAN_DRIVER_OVERRIDES
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+    {
+        return create();
+    }
+    unsafe { std::env::set_var("VK_LOADER_DRIVERS_DISABLE", SOFTWARE_VULKAN_DRIVERS) };
+    let result = create();
+    unsafe { std::env::remove_var("VK_LOADER_DRIVERS_DISABLE") };
+    result
+}
+
+#[cfg(all(not(target_family = "wasm"), not(target_os = "linux")))]
+fn without_software_vulkan_drivers<T>(_hardware_only: bool, create: impl FnOnce() -> T) -> T {
+    create()
 }
 
 #[cfg(not(target_family = "wasm"))]
