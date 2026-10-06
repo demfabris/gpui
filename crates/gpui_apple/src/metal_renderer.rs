@@ -2423,6 +2423,58 @@ fn main(@location(0) position: vec2<f32>) -> @location(0) vec4<f32> {
         Ok(())
     }
 
+    fn pane_glow_scene(width: f32, height: f32, glow: bool) -> Scene {
+        let mut scene = Scene::default();
+        let full = Bounds::new(point(px(0.0), px(0.0)), size(px(width), px(height))).scale(1.0);
+        let mut background = Quad::default();
+        background.bounds = full;
+        background.content_mask.bounds = full;
+        background.background = hsla(0.0, 0.0, 0.1, 1.0).into();
+        scene.insert_primitive(background);
+        if glow {
+            let element = Bounds::new(point(px(12.0), px(12.0)), size(px(width - 24.0), px(height - 24.0)));
+            let hole = (element + point(px(32.0), px(48.0))).dilate(px(16.0));
+            scene.insert_primitive(Shadow {
+                order: Default::default(),
+                blur_radius: px(192.0).scale(1.0),
+                bounds: hole.scale(1.0),
+                corner_radii: gpui::Corners::all(px(43.0).scale(1.0)),
+                content_mask: background.content_mask,
+                color: hsla(0.6, 0.8, 0.6, 0.06),
+                element_bounds: element.scale(1.0),
+                element_corner_radii: gpui::Corners::all(px(27.0).scale(1.0)),
+                inset: 1,
+                corner_smoothing: 4.0,
+            });
+        }
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test -p gpui_apple --release bench_pane_glow -- --ignored --nocapture"]
+    fn bench_pane_glow() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let (width, height) = (5344.0, 2964.0);
+        let target = size((width as i32).into(), (height as i32).into());
+        let mut time = |glow: bool| -> Result<f64> {
+            let scene = pane_glow_scene(width, height, glow);
+            renderer.render_scene_to_image(&scene, target)?;
+            let frames = 120;
+            let start = std::time::Instant::now();
+            for _ in 0..frames {
+                renderer.render_scene(&scene, target)?;
+            }
+            renderer.render_scene_to_image(&scene, target)?;
+            Ok(start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames + 1))
+        };
+        let plain = time(false)?;
+        let glow = time(true)?;
+        println!("pane glow {width}x{height}: background {plain:.3} ms, with glow {glow:.3} ms, glow {:.3} ms/frame", glow - plain);
+        Ok(())
+    }
+
     #[test]
     fn faint_inset_shadows_dither_dark_composites() -> Result<()> {
         let mut renderer =

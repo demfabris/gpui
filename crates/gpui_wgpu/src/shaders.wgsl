@@ -339,10 +339,18 @@ fn erf(v: vec2<f32>) -> vec2<f32> {
     return s - s / (r2 * r2);
 }
 
+fn erf4(v: vec4<f32>) -> vec4<f32> {
+    let s = sign(v);
+    let a = abs(v);
+    let r1 = 1.0 + (0.278393 + (0.230389 + (0.000972 + 0.078108 * a) * a) * a) * a;
+    let r2 = r1 * r1;
+    return s - s / (r2 * r2);
+}
+
 fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>, corner_smoothing: f32) -> f32 {
   let delta = min(half_size.y - corner - abs(y), 0.0);
   var reach = sqrt(max(0.0, corner * corner - delta * delta));
-  if (corner > 0.0 && corner_smoothing > 2.001) {
+  if (corner > 0.0 && corner_smoothing > 2.001 && delta < 0.0) {
     reach = corner * pow(max(0.0, 1.0 - pow(abs(delta) / corner, corner_smoothing)),
                          1.0 / corner_smoothing);
   }
@@ -1093,12 +1101,27 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     let center_to_point = input.position.xy - center;
 
     let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
+    let largest_corner = max(max(shadow.corner_radii.top_left, shadow.corner_radii.top_right),
+        max(shadow.corner_radii.bottom_left, shadow.corner_radii.bottom_right));
+    if (shadow.inset != 0u && shadow.blur_radius > 0.0) {
+        let interior = half_size - 3.0 * shadow.blur_radius - largest_corner;
+        if (all(abs(center_to_point) < interior)) {
+            discard;
+        }
+    }
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
         let distance = quad_sdf_smooth(input.position.xy, shadow.bounds,
             shadow.corner_radii, shadow.corner_smoothing);
         alpha = saturate(0.5 - distance);
+    } else if (largest_corner <= 0.25 * shadow.blur_radius) {
+        // Corners this small against the blur barely change the result, so blur
+        // a sharp rectangle instead: the gaussian separates into two erf pairs.
+        let edges = (vec4<f32>(center_to_point, center_to_point) +
+            vec4<f32>(half_size, -half_size)) * (sqrt(0.5) / shadow.blur_radius);
+        let integral = erf4(edges);
+        alpha = 0.25 * (integral.x - integral.z) * (integral.y - integral.w);
     } else {
         let smoothing = select(shadow.corner_smoothing, 2.0,
             corner_radius >= min(half_size.x, half_size.y) - 0.01);

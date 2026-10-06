@@ -33,6 +33,7 @@ float quad_sdf_impl(float2 center_to_point, float corner_radius,
                     float corner_smoothing);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
+float4 erf4(float4 x);
 float blur_along_x(float x, float y, float sigma, float corner,
                    float2 half_size, float corner_smoothing);
 float4 over(float4 below, float4 above);
@@ -518,6 +519,14 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
   float2 half_size = size / 2.;
   float2 center = origin + half_size;
   float2 point = input.position.xy - center;
+  if (shadow.inset != 0u && shadow.blur_radius > 0.) {
+    float max_corner = max(max(shadow.corner_radii.top_left, shadow.corner_radii.top_right),
+                           max(shadow.corner_radii.bottom_left, shadow.corner_radii.bottom_right));
+    float2 interior = half_size - 3. * shadow.blur_radius - max_corner;
+    if (all(abs(point) < interior)) {
+      discard_fragment();
+    }
+  }
   float corner_radius;
   if (point.x < 0.) {
     if (point.y < 0.) {
@@ -534,10 +543,19 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
   }
 
   float alpha;
+  float largest_corner = max(max(shadow.corner_radii.top_left, shadow.corner_radii.top_right),
+                             max(shadow.corner_radii.bottom_left, shadow.corner_radii.bottom_right));
   if (shadow.blur_radius == 0.) {
     float distance = quad_sdf_smooth(input.position.xy, shadow.bounds,
                                      shadow.corner_radii, shadow.corner_smoothing);
     alpha = saturate(0.5 - distance);
+  } else if (largest_corner <= 0.25 * shadow.blur_radius) {
+    // Corners this small against the blur barely change the result, so blur
+    // a sharp rectangle instead: the gaussian separates into two erf pairs.
+    float4 edges = (float4(point, point) + float4(half_size, -half_size)) *
+                   (sqrt(0.5) / shadow.blur_radius);
+    float4 integral = erf4(edges);
+    alpha = 0.25 * (integral.x - integral.z) * (integral.y - integral.w);
   } else {
     float smoothing = corner_radius >= min(half_size.x, half_size.y) - 0.01
         ? 2.0 : shadow.corner_smoothing;
@@ -1210,11 +1228,19 @@ float2 erf(float2 x) {
   return s - s / (r2 * r2);
 }
 
+float4 erf4(float4 x) {
+  float4 s = sign(x);
+  float4 a = abs(x);
+  float4 r1 = 1. + (0.278393 + (0.230389 + (0.000972 + 0.078108 * a) * a) * a) * a;
+  float4 r2 = r1 * r1;
+  return s - s / (r2 * r2);
+}
+
 float blur_along_x(float x, float y, float sigma, float corner,
                    float2 half_size, float corner_smoothing) {
   float delta = min(half_size.y - corner - abs(y), 0.);
   float reach = sqrt(max(0., corner * corner - delta * delta));
-  if (corner > 0. && corner_smoothing > 2.001) {
+  if (corner > 0. && corner_smoothing > 2.001 && delta < 0.) {
     reach = corner * pow(max(0., 1. - pow(abs(delta) / corner, corner_smoothing)),
                          1. / corner_smoothing);
   }
