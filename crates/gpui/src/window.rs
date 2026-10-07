@@ -1369,6 +1369,7 @@ pub(crate) struct InputRateTracker {
     inputs_per_second: u32,
     sustain_until: Instant,
     sustain_duration: Duration,
+    sustains_presentation: bool,
 }
 
 impl Default for InputRateTracker {
@@ -1379,6 +1380,7 @@ impl Default for InputRateTracker {
             inputs_per_second: 60,
             sustain_until: Instant::now(),
             sustain_duration: Duration::from_secs(1),
+            sustains_presentation: true,
         }
     }
 }
@@ -1397,6 +1399,10 @@ impl InputRateTracker {
 
     pub fn is_high_rate(&self) -> bool {
         Instant::now() < self.sustain_until
+    }
+
+    pub fn sustains_presentation(&self) -> bool {
+        self.sustains_presentation && self.is_high_rate()
     }
 
     fn prune_old_timestamps(&mut self, now: Instant) {
@@ -1699,7 +1705,10 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
-        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker {
+            sustains_presentation: platform_window.keeps_presenting_after_input(),
+            ..InputRateTracker::default()
+        }));
         let last_frame_time = Rc::new(Cell::new(None));
 
         platform_window
@@ -1900,10 +1909,11 @@ impl Window {
 
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
-                // to prevent display underclocking during active input.
+                // to prevent display underclocking during active input, unless the
+                // platform sets its refresh rate another way.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || input_rate_tracker.borrow().sustains_presentation();
 
                 if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
@@ -9138,6 +9148,35 @@ mod tests {
 
         assert!(test_window.simulate_scheduled_frame());
         assert!(callback_ran.get());
+    }
+
+    #[gpui::test]
+    fn fast_input_keeps_presenting_only_where_the_platform_asks(cx: &mut TestAppContext) {
+        for keeps_presenting in [true, false] {
+            let window = cx.add_window(|_, _| Empty);
+            let test_window = cx.test_window(window.into());
+            assert!(test_window.simulate_scheduled_frame());
+            assert!(test_window.simulate_scheduled_frame());
+            assert!(!test_window.frame_scheduled());
+
+            cx.update_window(window.into(), |_, window, _| {
+                window.active.set(true);
+                let mut tracker = window.input_rate_tracker.borrow_mut();
+                tracker.sustains_presentation = keeps_presenting;
+                for _ in 0..6 {
+                    tracker.record_input();
+                }
+            })
+            .unwrap();
+            test_window.simulate_frame_request(RequestFrameOptions::default());
+
+            assert_eq!(
+                test_window.frame_scheduled(),
+                keeps_presenting,
+                "an unchanged scene is presented again after fast input only when \
+                 the platform keeps presenting (keeps_presenting = {keeps_presenting})"
+            );
+        }
     }
 
     struct RootView {
