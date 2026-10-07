@@ -1103,6 +1103,7 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
+    a11y_index: a11y::A11yIndex,
 }
 
 #[derive(Clone, Default)]
@@ -4092,6 +4093,7 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
+            a11y_index: self.a11y.index(),
         }
     }
 
@@ -4353,6 +4355,7 @@ impl Window {
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
             self.text_system.truncate_layouts(index.line_layout_index);
+            self.a11y.truncate(index.a11y_index);
         }
         result
     }

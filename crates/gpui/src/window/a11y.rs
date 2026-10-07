@@ -329,6 +329,50 @@ impl A11y {
     pub(crate) fn frame_number(&self) -> u64 {
         self.debug.frame_number()
     }
+
+    pub(crate) fn index(&self) -> A11yIndex {
+        A11yIndex {
+            nodes: self.nodes.all_nodes.len(),
+            children: self
+                .nodes
+                .nodes_stack
+                .last()
+                .map_or(0, |node| node.children().len()),
+            focus: self.nodes.focus,
+            active_descendant: self.nodes.active_descendant,
+        }
+    }
+
+    /// Drops every node pushed since `index` was taken, so a prepaint that
+    /// [`Window::transact`] rolls back can push the same nodes again.
+    pub(crate) fn truncate(&mut self, index: A11yIndex) {
+        for (id, _) in self.nodes.all_nodes.drain(index.nodes..) {
+            self.nodes.seen_ids.remove(&id);
+            self.focus_ids.remove(&id);
+            self.node_bounds.remove(&id);
+            self.node_visible_bounds.remove(&id);
+            #[cfg(debug_assertions)]
+            self.nodes.node_info.remove(&id);
+        }
+        if let Some(parent) = self.nodes.nodes_stack.last_mut()
+            && parent.children().len() > index.children
+        {
+            let children = parent.children()[..index.children].to_vec();
+            parent.set_children(children);
+        }
+        self.nodes.focus = index.focus;
+        self.nodes.active_descendant = index.active_descendant;
+    }
+}
+
+/// How far the tree had been built at some point during prepaint. The nodes
+/// pushed between two indices hang off the node that was on top of the stack.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct A11yIndex {
+    nodes: usize,
+    children: usize,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
 }
 
 /// Builder API for synthetic children. See the docs for

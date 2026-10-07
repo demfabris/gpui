@@ -1752,8 +1752,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
-        px, size,
+        IntoElement, ListState, ParentElement, Render, StatefulInteractiveElement, Styled,
+        TestAppContext, Window, canvas, div, list, point, px, size,
     };
 
     #[gpui::test]
@@ -2996,5 +2996,78 @@ mod test {
              the bottom of its track, even when content has grown during the drag \
              (so frozen_bottom < live_bottom)"
         );
+    }
+
+    #[gpui::test]
+    fn test_autoscroll_retry_keeps_one_a11y_node_per_row(cx: &mut TestAppContext) {
+        struct A11yRowsView {
+            state: ListState,
+            focus: crate::FocusHandle,
+        }
+        impl Render for A11yRowsView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let focus = self.focus.clone();
+                list(self.state.clone(), move |ix, _, _| {
+                    let row = div()
+                        .id(("row", ix))
+                        .role(accesskit::Role::ListItem)
+                        .h(px(20.))
+                        .w_full();
+                    if ix == 1 {
+                        row.track_focus(&focus)
+                            .child(
+                                canvas(
+                                    |bounds, window, _| window.request_autoscroll(bounds),
+                                    |_, _, _, _| {},
+                                )
+                                .size_full(),
+                            )
+                            .into_any()
+                    } else {
+                        row.into_any()
+                    }
+                })
+                .w_full()
+                .h(px(30.))
+            }
+        }
+
+        let state = ListState::new(3, crate::ListAlignment::Top, px(10.));
+        let focus = cx.update(|cx| cx.focus_handle());
+        let window = cx.add_window(|_, _| A11yRowsView {
+            state: state.clone(),
+            focus: focus.clone(),
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.set_a11y_forced(true);
+            window.focus(&focus, cx);
+            state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+            window.draw(cx).clear(cx);
+
+            assert_eq!(state.logical_scroll_top().offset_in_item, px(10.));
+            let tree = window.a11y_tree().expect("forced a11y builds a tree");
+            let mut rows = tree
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == accesskit::Role::ListItem)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            let row_count = rows.len();
+            rows.sort_unstable_by_key(|id| id.0);
+            rows.dedup();
+            assert_eq!(rows.len(), row_count);
+            assert!(rows.contains(&tree.focus));
+            let parents = tree
+                .nodes
+                .iter()
+                .flat_map(|(_, node)| node.children())
+                .filter(|child| rows.contains(child))
+                .count();
+            assert_eq!(parents, row_count);
+        })
+        .unwrap();
     }
 }
