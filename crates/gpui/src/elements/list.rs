@@ -714,6 +714,7 @@ impl ListState {
         let state = &*self.0.borrow();
 
         let bounds = state.last_layout_bounds.unwrap_or_default();
+        let padding = state.last_padding.unwrap_or_default();
         let scroll_top = state.logical_scroll_top();
         if ix < scroll_top.item_ix {
             return None;
@@ -728,7 +729,7 @@ impl ListState {
         if let Some(&ListItem::Measured { size, .. }) = cursor.item() {
             let &Dimensions(Count(count), Height(top), _) = cursor.start();
             if count == ix {
-                let top = bounds.top() + top - scroll_top;
+                let top = bounds.top() + padding.top + top - scroll_top;
                 return Some(Bounds::from_corners(
                     point(bounds.left(), top),
                     point(bounds.right(), top + size.height),
@@ -2088,6 +2089,58 @@ mod test {
         assert_eq!(state.logical_scroll_top().item_ix, state.item_count());
         assert_eq!(state.item_is_above_viewport(0), Some(true));
         assert_eq!(state.item_is_below_viewport(0), Some(false));
+    }
+
+    #[gpui::test]
+    fn test_bounds_for_item_includes_top_padding(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(5, crate::ListAlignment::Top, px(10.)).measure_all();
+        let painted = Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        struct PaddedListView(
+            ListState,
+            Rc<std::cell::RefCell<Vec<Bounds<crate::Pixels>>>>,
+        );
+        impl Render for PaddedListView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let painted = self.1.clone();
+                list(self.0.clone(), move |_, _, _| {
+                    let painted = painted.clone();
+                    canvas(
+                        move |bounds, _, _| painted.borrow_mut().push(bounds),
+                        |_, _, _, _| {},
+                    )
+                    .h(px(20.))
+                    .w_full()
+                    .into_any()
+                })
+                .pt(px(30.))
+                .w_full()
+                .h_full()
+            }
+        }
+
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: px(5.),
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| PaddedListView(state.clone(), painted.clone()))
+                .into_any_element()
+        });
+
+        let painted = painted.borrow();
+        let first = painted.first().copied().expect("rows were prepainted");
+        assert_eq!(first.top(), px(25.));
+        assert_eq!(
+            state.bounds_for_item(1).map(|bounds| bounds.top()),
+            Some(first.top())
+        );
+        assert_eq!(
+            state.bounds_for_item(2).map(|bounds| bounds.top()),
+            Some(px(45.))
+        );
     }
 
     #[gpui::test]
