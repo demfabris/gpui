@@ -2917,6 +2917,17 @@ impl Window {
             .map(|length| length / self.zoom)
     }
 
+    /// Returns where the visual viewport comes to rest once the platform's
+    /// transition in progress ends, such as a software keyboard sliding.
+    ///
+    /// Equal to `visual_viewport_bounds` while nothing is moving, so layout
+    /// can size content for the end of a keyboard motion from its first frame.
+    pub fn target_visual_viewport_bounds(&self) -> Bounds<Pixels> {
+        self.platform_window
+            .target_visual_viewport_bounds()
+            .map(|length| length / self.zoom)
+    }
+
     /// Returns a conservative rectangle avoiding platform-known obscured content.
     ///
     /// Intersects the visual viewport with the full layout area inset by system

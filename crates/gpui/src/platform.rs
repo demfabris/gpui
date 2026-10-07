@@ -926,6 +926,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// This requests a frame; backends can sample the new viewport and safe-area
     /// geometry in `prepare_frame` rather than updating it inside the callback.
     fn on_visual_viewport_changed(&self, _callback: Box<dyn FnMut()>) {}
+    /// Returns where the visible viewport comes to rest once the transition
+    /// in progress ends, such as a software keyboard sliding in or out.
+    ///
+    /// Equal to `visual_viewport_bounds` while nothing is moving. Like it, this
+    /// must be a frame snapshot.
+    fn target_visual_viewport_bounds(&self) -> Bounds<Pixels> {
+        self.visual_viewport_bounds()
+    }
     /// Samples platform geometry before a draw, returning whether view caches must be invalidated.
     ///
     /// Geometry getters must remain consistent throughout the ensuing draw.
@@ -2204,6 +2212,34 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// The kind of data entered, which picks the software keyboard's layout.
+    pub input_mode: TextInputMode,
+}
+
+/// The kind of data a text region accepts, used to pick a software keyboard.
+///
+/// The variants are the HTML `inputmode` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-inputmode-attribute>),
+/// which also maps onto iOS's `UIKeyboardType` and Android's `InputType`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputMode {
+    /// Ordinary text in the user's locale.
+    #[default]
+    Text,
+    /// No software keyboard; the region supplies its own input.
+    None,
+    /// Fractional numbers: digits and the locale's decimal separator.
+    Decimal,
+    /// Whole numbers: digits only.
+    Numeric,
+    /// Telephone numbers.
+    Tel,
+    /// Search queries.
+    Search,
+    /// Email addresses.
+    Email,
+    /// URLs.
+    Url,
 }
 
 /// Automatic capitalization applied by software keyboards.
