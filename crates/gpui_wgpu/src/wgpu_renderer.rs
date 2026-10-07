@@ -20,9 +20,9 @@ use std::sync::Arc;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
-const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
+const INITIAL_INSTANCE_DATA_SIZE: u64 = 2 * 1024 * 1024;
 
-const INSTANCE_BIND_GROUP_KEEP_FRAMES: u64 = 2;
+const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
@@ -47,6 +47,16 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_storage.wgsl"),
     include_str!("shaders_subpixel.wgsl"),
 );
+
+fn instance_part<T>(instances: &[T]) -> (&[u8], u64) {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            instances.as_ptr() as *const u8,
+            std::mem::size_of_val(instances),
+        )
+    };
+    (bytes, (std::mem::size_of::<T>() as u64).max(1))
+}
 
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
@@ -198,11 +208,10 @@ struct WgpuPipelines {
 /// One frame allocation of instance data, ready to bind.
 struct InstanceBinding {
     bind_group: wgpu::BindGroup,
-    /// Index of the allocation's first instance within the bound data. Always
-    /// zero on the storage-buffer path, where the binding offset already
-    /// positions the array; on the WebGL texture path the shader indexes the
-    /// shared instance texture absolutely, so draws must offset their
-    /// instance (or vertex) ranges by this value.
+    /// Index of the allocation's first instance within the bound data. The
+    /// bind group covers the whole instance buffer or texture and the shader
+    /// indexes it absolutely, so draws offset their instance (or vertex)
+    /// ranges by this value.
     first_instance: u32,
 }
 
@@ -248,6 +257,11 @@ struct WgpuResources {
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_data: InstanceData,
+    instance_bind_group: wgpu::BindGroup,
+    staging_belt: wgpu::util::StagingBelt,
+    /// Copies this frame's instance data out of the staging belt. Submitted
+    /// ahead of the frame's draws.
+    upload_encoder: Option<wgpu::CommandEncoder>,
     path_intermediate_texture: Option<wgpu::Texture>,
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
@@ -424,8 +438,6 @@ struct WgpuRendererCore {
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
     clip_window_shadows: bool,
-    instance_bind_groups: FxHashMap<(wgpu::Buffer, u64, u64), (wgpu::BindGroup, u64)>,
-    instance_bind_group_frame: u64,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1428,7 +1440,7 @@ impl WgpuRendererCore {
             let max_instance_data_size = (u64::from(max_texture_dimension).pow(2)
                 * INSTANCE_TEXTURE_TEXEL_SIZE)
                 .min(MAX_INSTANCE_BUFFER_SIZE);
-            let initial_capacity = (2 * 1024 * 1024).min(max_instance_data_size);
+            let initial_capacity = INITIAL_INSTANCE_DATA_SIZE.min(max_instance_data_size);
             let (instance_data, capacity) =
                 Self::create_instance_texture(&device, initial_capacity, max_texture_dimension);
             (
@@ -1443,7 +1455,7 @@ impl WgpuRendererCore {
                 .max_buffer_size
                 .min(device.limits().max_storage_buffer_binding_size)
                 .min(MAX_INSTANCE_BUFFER_SIZE);
-            let initial_capacity = (2 * 1024 * 1024).min(max_buffer_size);
+            let initial_capacity = INITIAL_INSTANCE_DATA_SIZE.min(max_buffer_size);
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instance_buffer"),
                 size: initial_capacity,
@@ -1454,9 +1466,13 @@ impl WgpuRendererCore {
                 InstanceData::Storage(buffer),
                 initial_capacity,
                 max_buffer_size,
-                device.limits().min_storage_buffer_offset_alignment as u64,
+                wgpu::COPY_BUFFER_ALIGNMENT,
             )
         };
+        let instance_bind_group =
+            Self::create_instance_bind_group(&device, &bind_group_layouts, &instance_data);
+        let staging_belt =
+            wgpu::util::StagingBelt::new((*device).clone(), INITIAL_INSTANCE_DATA_SIZE);
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals_bind_group"),
             layout: &bind_group_layouts.globals,
@@ -1516,6 +1532,9 @@ impl WgpuRendererCore {
                 globals_bind_group,
                 path_globals_bind_group,
                 instance_data,
+                instance_bind_group,
+                staging_belt,
+                upload_encoder: None,
                 path_intermediate_texture: None,
                 path_intermediate_view: None,
                 path_msaa_texture: None,
@@ -1537,9 +1556,25 @@ impl WgpuRendererCore {
             target_format,
             max_texture_size,
             clip_window_shadows: false,
-            instance_bind_groups: FxHashMap::default(),
-            instance_bind_group_frame: 0,
         }
+    }
+
+    fn create_instance_bind_group(
+        device: &wgpu::Device,
+        layouts: &WgpuBindGroupLayouts,
+        instance_data: &InstanceData,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("instances_bind_group"),
+            layout: &layouts.instances,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: match instance_data {
+                    InstanceData::Storage(buffer) => buffer.as_entire_binding(),
+                    InstanceData::Texture { view, .. } => wgpu::BindingResource::TextureView(view),
+                },
+            }],
+        })
     }
 
     fn resources(&self) -> &WgpuResources {
@@ -1606,10 +1641,6 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.instance_bind_group_frame += 1;
-        let frame = self.instance_bind_group_frame;
-        self.instance_bind_groups
-            .retain(|_, (_, used)| *used + INSTANCE_BIND_GROUP_KEEP_FRAMES >= frame);
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1696,7 +1727,7 @@ impl WgpuRendererCore {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("main_encoder"),
                 });
-        self.encode_scene(
+        let encoded = self.encode_scene(
             &mut encoder,
             scene,
             frame_view,
@@ -1704,15 +1735,24 @@ impl WgpuRendererCore {
             wgpu::LoadOp::Clear(clear_color),
             &mut instance_offset,
             0,
-        )?;
-        if !self.resources.shader_layers.drawn {
+        );
+        if encoded.is_ok() && !self.resources.shader_layers.drawn {
             self.resources.shader_layers.release_textures();
         }
 
-        let submission = self
-            .resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
+        let resources = &mut self.resources;
+        let uploads = resources
+            .upload_encoder
+            .take()
+            .map(|uploads| uploads.finish());
+        resources.staging_belt.finish();
+        let submission = resources.queue.submit(
+            uploads
+                .into_iter()
+                .chain(encoded.is_ok().then(|| encoder.finish())),
+        );
+        resources.staging_belt.recall();
+        encoded?;
         Ok(submission)
     }
 
@@ -2054,37 +2094,31 @@ impl WgpuRendererCore {
         scene: &Scene,
         instance_offset: &mut u64,
     ) -> Result<InstanceBindings> {
+        let [
+            quads,
+            shadows,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
+        ] = self.write_instance_bindings(
+            instance_offset,
+            [
+                instance_part(&scene.quads),
+                instance_part(&scene.shadows),
+                instance_part(&scene.underlines),
+                instance_part(&scene.monochrome_sprites),
+                instance_part(&scene.subpixel_sprites),
+                instance_part(&scene.polychrome_sprites),
+            ],
+        )?;
         Ok(InstanceBindings {
-            quads: self.write_instance_binding(
-                "quads_bind_group",
-                instance_offset,
-                &scene.quads,
-            )?,
-            shadows: self.write_instance_binding(
-                "shadows_bind_group",
-                instance_offset,
-                &scene.shadows,
-            )?,
-            underlines: self.write_instance_binding(
-                "underlines_bind_group",
-                instance_offset,
-                &scene.underlines,
-            )?,
-            monochrome_sprites: self.write_instance_binding(
-                "monochrome_sprites_bind_group",
-                instance_offset,
-                &scene.monochrome_sprites,
-            )?,
-            subpixel_sprites: self.write_instance_binding(
-                "subpixel_sprites_bind_group",
-                instance_offset,
-                &scene.subpixel_sprites,
-            )?,
-            polychrome_sprites: self.write_instance_binding(
-                "polychrome_sprites_bind_group",
-                instance_offset,
-                &scene.polychrome_sprites,
-            )?,
+            quads,
+            shadows,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
         })
     }
 
@@ -2185,8 +2219,7 @@ impl WgpuRendererCore {
                 corner_smoothing: surface.corner_smoothing,
                 pad: 0.0,
             };
-            let instances =
-                self.write_instance_binding("surfaces_bind_group", instance_offset, &[params])?;
+            let instances = self.write_instance_binding(instance_offset, &[params])?;
             let texture =
                 self.create_texture_bind_group("surface_texture_bind_group", &surface.texture_view);
             let resources = self.resources();
@@ -2247,15 +2280,6 @@ impl WgpuRendererCore {
         Ok(())
     }
 
-    unsafe fn instance_bytes<T>(instances: &[T]) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                instances.as_ptr() as *const u8,
-                std::mem::size_of_val(instances),
-            )
-        }
-    }
-
     fn draw_paths_from_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
@@ -2282,8 +2306,7 @@ impl WgpuRendererCore {
         let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
             return Ok(());
         };
-        let instances =
-            self.write_instance_binding("path_sprites_bind_group", instance_offset, &sprites)?;
+        let instances = self.write_instance_binding(instance_offset, &sprites)?;
         let texture = self.create_texture_bind_group(
             "path_intermediate_texture_bind_group",
             &path_intermediate_view,
@@ -2324,11 +2347,7 @@ impl WgpuRendererCore {
 
         self.ensure_intermediate_textures(size);
 
-        let vertex_binding = self.write_instance_binding(
-            "path_rasterization_bind_group",
-            instance_offset,
-            &vertices,
-        )?;
+        let vertex_binding = self.write_instance_binding(instance_offset, &vertices)?;
 
         let resources = self.resources();
         let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
@@ -2375,88 +2394,90 @@ impl WgpuRendererCore {
 
     fn write_instance_binding<T>(
         &mut self,
-        label: &str,
         instance_offset: &mut u64,
         instances: &[T],
     ) -> Result<InstanceBinding> {
-        let data = unsafe { Self::instance_bytes(instances) };
-        // wgpu rejects zero-sized bindings, so empty primitive arrays still
-        // reserve the 16-byte minimum.
-        let size = (data.len() as u64).max(16);
-        let stride = (std::mem::size_of::<T>() as u64).max(1);
-        let (alignment, allocation_size) = if self.uses_webgl_instance_data {
-            // The texture transport has no binding offset: the shader indexes
-            // the instance texture absolutely, so each allocation must start on
-            // a whole instance (a stride multiple) and a whole texel, and must
-            // end on a texel boundary so the zero padding of its final partial
-            // texel cannot overlap the next allocation.
-            (
-                least_common_multiple(self.instance_data_alignment, stride),
-                size.next_multiple_of(INSTANCE_TEXTURE_TEXEL_SIZE),
-            )
-        } else {
-            (self.instance_data_alignment.max(1), size)
+        let [binding] =
+            self.write_instance_bindings(instance_offset, [instance_part(instances)])?;
+        Ok(binding)
+    }
+
+    /// Places each part (its bytes and record stride) after `instance_offset`
+    /// and uploads them together. Every allocation starts on a whole record so
+    /// the shader can index the shared buffer or texture absolutely, and ends
+    /// on the transport's alignment so its padding cannot overlap the next.
+    fn write_instance_bindings<const N: usize>(
+        &mut self,
+        instance_offset: &mut u64,
+        parts: [(&[u8], u64); N],
+    ) -> Result<[InstanceBinding; N]> {
+        let alignment = self.instance_data_alignment;
+        let place = |start: u64| {
+            let mut end = start;
+            let offsets = parts.map(|(data, stride)| {
+                if data.is_empty() {
+                    return end;
+                }
+                let offset = end.next_multiple_of(least_common_multiple(alignment, stride));
+                end = offset + (data.len() as u64).next_multiple_of(alignment);
+                offset
+            });
+            (offsets, end)
         };
-        let mut offset = (*instance_offset).next_multiple_of(alignment);
-        if offset + allocation_size > self.instance_data_capacity {
-            self.grow_instance_data(allocation_size)?;
-            offset = 0;
+        let (mut offsets, mut end) = place(*instance_offset);
+        if end > self.instance_data_capacity {
+            self.grow_instance_data(place(0).1)?;
+            (offsets, end) = place(0);
         }
-        *instance_offset = offset + allocation_size;
+        *instance_offset = end;
 
-        let first_instance = if self.uses_webgl_instance_data {
-            u32::try_from(offset / stride).context("instance index exceeds u32 range")?
-        } else {
-            0
-        };
-
-        let resources = &self.resources;
-        if !data.is_empty() {
-            match &resources.instance_data {
-                InstanceData::Storage(buffer) => resources.queue.write_buffer(buffer, offset, data),
-                InstanceData::Texture { .. } => {
-                    Self::write_instance_texture(resources, offset, data)
+        let resources = &mut self.resources;
+        match &resources.instance_data {
+            InstanceData::Storage(buffer) => {
+                let start = parts
+                    .iter()
+                    .zip(offsets)
+                    .find(|((data, _), _)| !data.is_empty())
+                    .map(|(_, offset)| offset);
+                if let Some(start) = start
+                    && let Some(size) = NonZeroU64::new(end - start)
+                {
+                    let encoder = resources.upload_encoder.get_or_insert_with(|| {
+                        resources
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("instance_upload_encoder"),
+                            })
+                    });
+                    let mut view = resources
+                        .staging_belt
+                        .write_buffer(encoder, buffer, start, size);
+                    for ((data, _), offset) in parts.iter().zip(offsets) {
+                        let at = (offset - start) as usize;
+                        view.slice(at..at + data.len()).copy_from_slice(data);
+                    }
+                }
+            }
+            InstanceData::Texture { .. } => {
+                for ((data, _), offset) in parts.iter().zip(offsets) {
+                    if !data.is_empty() {
+                        Self::write_instance_texture(resources, offset, data);
+                    }
                 }
             }
         }
-        let create_bind_group = |resource| {
-            resources
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(label),
-                    layout: &resources.bind_group_layouts.instances,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource,
-                    }],
-                })
-        };
-        let frame = self.instance_bind_group_frame;
-        let bind_group = match &resources.instance_data {
-            InstanceData::Storage(buffer) => {
-                let key = (buffer.clone(), offset, size);
-                let (bind_group, used) =
-                    self.instance_bind_groups.entry(key).or_insert_with(|| {
-                        (
-                            create_bind_group(wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer,
-                                offset,
-                                size: NonZeroU64::new(size),
-                            })),
-                            frame,
-                        )
-                    });
-                *used = frame;
-                bind_group.clone()
-            }
-            InstanceData::Texture { view, .. } => {
-                create_bind_group(wgpu::BindingResource::TextureView(view))
-            }
-        };
-        Ok(InstanceBinding {
-            bind_group,
+
+        let mut first_instances = [0; N];
+        for (first_instance, ((_, stride), offset)) in
+            first_instances.iter_mut().zip(parts.iter().zip(offsets))
+        {
+            *first_instance =
+                u32::try_from(offset / stride).context("instance index exceeds u32 range")?;
+        }
+        Ok(first_instances.map(|first_instance| InstanceBinding {
+            bind_group: resources.instance_bind_group.clone(),
             first_instance,
-        })
+        }))
     }
 
     fn write_instance_texture(resources: &WgpuResources, offset: u64, data: &[u8]) {
@@ -2583,6 +2604,12 @@ impl WgpuRendererCore {
                 }));
             self.instance_data_capacity = capacity;
         }
+        let resources = &mut self.resources;
+        resources.instance_bind_group = Self::create_instance_bind_group(
+            &resources.device,
+            &resources.bind_group_layouts,
+            &resources.instance_data,
+        );
         Ok(())
     }
 }
@@ -3226,7 +3253,8 @@ where
         device_id_override.as_deref(),
         reject_software,
         |backends, reject_software| {
-            let instance = WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
+            let instance =
+                WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
             let surface = create_surface(&instance, raw_window_handle)?;
             let context = if reject_software {
                 WgpuContext::new_rejecting_software(instance, &surface, compositor_gpu)?
@@ -3479,7 +3507,10 @@ mod tests {
             surface.commit();
             let mut state = State::default();
             events.roundtrip(&mut state)?;
-            anyhow::ensure!(state.configured, "compositor did not configure the test window");
+            anyhow::ensure!(
+                state.configured,
+                "compositor did not configure the test window"
+            );
 
             let instance = WgpuContext::instance_with_backends(
                 Some(Box::new(connection.backend())),
@@ -3525,12 +3556,20 @@ mod tests {
                 let core = renderer.core_mut().context("ready renderer")?;
                 core.instance_data_capacity = capacity;
                 core.max_instance_data_size = maximum;
-                assert!(renderer.draw(&scene), "healthy frame after error {attempt} failed");
+                assert!(
+                    renderer.draw(&scene),
+                    "healthy frame after error {attempt} failed"
+                );
                 events.roundtrip(&mut state)?;
                 eprintln!("frame recovery attempt {attempt}: healthy frame presented");
             }
             let mut error_generation = 0;
-            assert!(context.errors().observe_error(&mut error_generation).is_none());
+            assert!(
+                context
+                    .errors()
+                    .observe_error(&mut error_generation)
+                    .is_none()
+            );
             drop(renderer);
             toplevel.destroy();
             shell_surface.destroy();
@@ -4079,7 +4118,7 @@ fn main(@location(0) position: vec2<f32>) -> @location(0) vec4<f32> {
             pad: [35, 36, 37],
         };
 
-        let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&quad)) };
+        let (bytes, _) = instance_part(std::slice::from_ref(&quad));
         let words: &[u32] = bytemuck::cast_slice(bytes);
         assert_eq!(
             words,
@@ -4130,5 +4169,253 @@ fn main(@location(0) position: vec2<f32>) -> @location(0) vec4<f32> {
                 37,
             ]
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod instance_upload {
+        use super::*;
+        use gpui::{
+            AtlasKey, AtlasTile, DevicePixels, PlatformAtlas, PlatformHeadlessRenderer,
+            RenderSvgParams, Scene, TransformationMatrix, hsla,
+        };
+        use std::borrow::Cow;
+        use std::time::{Duration, Instant};
+
+        const COLUMNS: usize = 45;
+        const ROWS: usize = 60;
+        const CELL: f32 = 26.0;
+
+        fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+            Bounds {
+                origin: Point {
+                    x: x.into(),
+                    y: y.into(),
+                },
+                size: Size {
+                    width: width.into(),
+                    height: height.into(),
+                },
+            }
+        }
+
+        fn page(
+            scene: &mut Scene,
+            left: f32,
+            width: f32,
+            height: f32,
+            tile: &AtlasTile,
+            extra: usize,
+        ) {
+            let page = rect(left, 0.0, width, height);
+            let mask = ContentMask { bounds: page };
+            let color = hsla(0.6, 0.2, 0.5, 1.0);
+            scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: 96.0.into(),
+                bounds: page,
+                corner_radii: Corners::all(24.0.into()),
+                content_mask: mask,
+                color: hsla(0.6, 0.8, 0.6, 0.06),
+                element_bounds: page,
+                element_corner_radii: Corners::all(24.0.into()),
+                inset: 1,
+                corner_smoothing: 4.0,
+            });
+            for row in 0..ROWS + extra {
+                let y = row as f32 * CELL * 1.6;
+                let line = rect(left, y, width, CELL * 1.6);
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: line,
+                    content_mask: mask,
+                    background: hsla(0.0, 0.0, 0.1 + row as f32 * 0.001, 1.0).into(),
+                    border_color: color,
+                    corner_radii: Corners::default(),
+                    border_widths: Edges::default(),
+                    corner_smoothing: 2.0,
+                    pad: [0; 3],
+                });
+                if row % 9 == 0 {
+                    scene.insert_primitive(Underline {
+                        order: 0,
+                        pad: 0,
+                        bounds: rect(left, y + CELL * 1.4, width / 3.0, 2.0),
+                        content_mask: mask,
+                        color,
+                        thickness: 2.0.into(),
+                        wavy: false.into(),
+                    });
+                }
+                for column in 0..COLUMNS {
+                    scene.insert_primitive(MonochromeSprite {
+                        order: 0,
+                        pad: 0,
+                        bounds: rect(left + column as f32 * CELL, y, CELL, CELL * 1.4),
+                        content_mask: mask,
+                        color,
+                        tile: *tile,
+                        transformation: TransformationMatrix::unit(),
+                    });
+                }
+            }
+        }
+
+        /// One frame of a page swipe on a 1179x2556 phone: two terminal pages
+        /// of 45x60 glyphs side by side, offset by the swipe.
+        fn swipe_frame(frame: usize, tile: &AtlasTile, changing: bool) -> Scene {
+            let (width, height) = (1179.0, 2556.0);
+            let offset = (frame % 60) as f32 / 60.0 * width;
+            let extra = if changing { frame % 3 } else { 0 };
+            let mut scene = Scene::default();
+            page(&mut scene, -offset, width, height, tile, extra);
+            page(&mut scene, width - offset, width, height, tile, 0);
+            scene.finish();
+            scene
+        }
+
+        fn glyph_tile(renderer: &WgpuHeadlessRenderer) -> anyhow::Result<AtlasTile> {
+            let size = Size {
+                width: DevicePixels(8),
+                height: DevicePixels(8),
+            };
+            renderer
+                .core
+                .atlas
+                .get_or_insert_with(
+                    AtlasKey::Svg(RenderSvgParams {
+                        path: "glyph".into(),
+                        size,
+                    }),
+                    &mut || Ok(Some((size, Cow::Owned(vec![255; 64])))),
+                )?
+                .ok_or_else(|| anyhow::anyhow!("no glyph tile"))
+        }
+
+        /// Quads come first in the instance buffer, so the underline and the
+        /// glyph sit behind a varying number of quads and must be found by
+        /// their first instance, including in the buffer a grow replaced.
+        #[test]
+        fn each_primitive_kind_draws_its_own_instances() -> anyhow::Result<()> {
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            let tile = glyph_tile(&renderer)?;
+            let red = hsla(0.0, 1.0, 0.5, 1.0);
+            let green = hsla(1.0 / 3.0, 1.0, 0.5, 1.0);
+            let blue = hsla(2.0 / 3.0, 1.0, 0.5, 1.0);
+            for hidden_quads in [0, 7, 3] {
+                if hidden_quads == 3 {
+                    renderer.core.instance_data_capacity = 16;
+                }
+                let mut scene = Scene::default();
+                let screen = ContentMask {
+                    bounds: rect(0.0, 0.0, 48.0, 16.0),
+                };
+                for ix in 0..=hidden_quads {
+                    let bounds = if ix == hidden_quads {
+                        rect(0.0, 0.0, 16.0, 16.0)
+                    } else {
+                        rect(100.0, 0.0, 16.0, 16.0)
+                    };
+                    scene.insert_primitive(Quad {
+                        order: 0,
+                        border_style: BorderStyle::Solid,
+                        bounds,
+                        content_mask: ContentMask { bounds },
+                        background: red.into(),
+                        border_color: red,
+                        corner_radii: Corners::default(),
+                        border_widths: Edges::default(),
+                        corner_smoothing: 2.0,
+                        pad: [0; 3],
+                    });
+                }
+                scene.insert_primitive(Underline {
+                    order: 0,
+                    pad: 0,
+                    bounds: rect(16.0, 0.0, 16.0, 16.0),
+                    content_mask: screen,
+                    color: green,
+                    thickness: 16.0.into(),
+                    wavy: false.into(),
+                });
+                scene.insert_primitive(MonochromeSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds: rect(32.0, 0.0, 16.0, 16.0),
+                    content_mask: screen,
+                    color: blue,
+                    tile,
+                    transformation: TransformationMatrix::unit(),
+                });
+                scene.finish();
+
+                let image = renderer.render_scene_to_image(
+                    &scene,
+                    Size {
+                        width: DevicePixels(48),
+                        height: DevicePixels(16),
+                    },
+                )?;
+                for (x, expected) in [
+                    (8, [255, 0, 0, 255]),
+                    (24, [0, 255, 0, 255]),
+                    (40, [0, 0, 255, 255]),
+                ] {
+                    let actual = image.get_pixel(x, 8).0;
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(actual, expected)| actual.abs_diff(expected) <= 3),
+                        "pixel ({x}, 8) behind {hidden_quads} hidden quads was {actual:?}, \
+                         expected {expected:?}"
+                    );
+                }
+            }
+            assert!(renderer.core.instance_data_capacity > 16);
+            Ok(())
+        }
+
+        fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
+            sorted[((sorted.len() - 1) as f64 * fraction).round() as usize]
+        }
+
+        #[test]
+        #[ignore = "benchmark: cargo test -p gpui_wgpu --release bench_swipe_frames -- --ignored --nocapture"]
+        fn bench_swipe_frames() -> anyhow::Result<()> {
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            let tile = glyph_tile(&renderer)?;
+            let size = Size {
+                width: DevicePixels(1179),
+                height: DevicePixels(2556),
+            };
+            for changing in [false, true] {
+                let mut times = Vec::new();
+                for frame in 0..660 {
+                    let scene = swipe_frame(frame, &tile, changing);
+                    let start = Instant::now();
+                    renderer.render(&scene, size)?;
+                    let elapsed = start.elapsed();
+                    renderer
+                        .context
+                        .device
+                        .poll(wgpu::PollType::wait_indefinitely())?;
+                    if frame >= 60 {
+                        times.push(elapsed);
+                    }
+                }
+                times.sort_unstable();
+                let mean = times.iter().sum::<Duration>() / times.len() as u32;
+                println!(
+                    "{} counts: {} frames, CPU per frame mean {:.1} us, p50 {:.1} us, p95 {:.1} us",
+                    if changing { "changing" } else { "stable" },
+                    times.len(),
+                    mean.as_secs_f64() * 1e6,
+                    percentile(&times, 0.5).as_secs_f64() * 1e6,
+                    percentile(&times, 0.95).as_secs_f64() * 1e6,
+                );
+            }
+            Ok(())
+        }
     }
 }
