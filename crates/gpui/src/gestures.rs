@@ -823,6 +823,9 @@ struct Momentum {
     duration: Duration,
     /// Distance already emitted along `direction`, in pixels.
     emitted_distance: f32,
+    /// Set by [`TouchGestureRecognizer::end_momentum`]: the next tick closes
+    /// the scroll stream without moving it further.
+    ended: bool,
 }
 
 impl TouchGestureRecognizer {
@@ -1075,6 +1078,7 @@ impl TouchGestureRecognizer {
                                 started_at: now,
                                 duration,
                                 emitted_distance,
+                                ended: false,
                             });
                         }
                     }
@@ -1227,8 +1231,25 @@ impl TouchGestureRecognizer {
         self.tick_momentum_at(Instant::now())
     }
 
+    /// Ends the fling in progress, if any. Its next tick closes the scroll
+    /// stream with a zero-delta [`TouchPhase::Ended`].
+    pub(crate) fn end_momentum(&mut self) {
+        if let Some(momentum) = self.momentum.as_mut() {
+            momentum.ended = true;
+        }
+    }
+
     fn tick_momentum_at(&mut self, now: Instant) -> Option<RecognizedTouchGesture> {
         let momentum = self.momentum.as_mut()?;
+        if momentum.ended {
+            let position = momentum.position;
+            self.momentum = None;
+            return Some(RecognizedTouchGesture::Scroll(scroll_event(
+                position,
+                Point::default(),
+                TouchPhase::Ended,
+            )));
+        }
         let elapsed = now.duration_since(momentum.started_at);
         let distance = self
             .tuning
@@ -1961,6 +1982,42 @@ mod tests {
         }
         assert_eq!(last_phase, TouchPhase::Ended);
         assert!(recognizer.tick_momentum_at(time).is_none());
+    }
+
+    #[test]
+    fn ended_momentum_closes_its_stream_on_the_next_tick() {
+        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+        let now = Instant::now();
+        let touch = TouchId(1);
+
+        recognizer.handle_event_at(&touch_event(touch, TouchPhase::Started, 300., 100.), now);
+        for step in 1..=5 {
+            recognizer.handle_event_at(
+                &touch_event(touch, TouchPhase::Moved, 300. - step as f32 * 40., 100.),
+                now + Duration::from_millis(step * 16),
+            );
+        }
+        recognizer.handle_event_at(
+            &touch_event(touch, TouchPhase::Ended, 100., 100.),
+            now + Duration::from_millis(6 * 16),
+        );
+        assert!(recognizer.has_momentum());
+
+        recognizer.end_momentum();
+        assert!(recognizer.has_momentum());
+        let recognized = recognizer.tick_momentum_at(now + Duration::from_millis(7 * 16));
+        let Some(RecognizedTouchGesture::Scroll(scroll)) = recognized else {
+            panic!("expected the closing scroll, got {recognized:?}");
+        };
+        assert_eq!(scroll.touch_phase, TouchPhase::Ended);
+        assert_eq!(scroll.position, point(px(300.), px(100.)));
+        assert_eq!(scroll.delta.pixel_delta(px(16.)), Point::default());
+        assert!(!recognizer.has_momentum());
+        assert!(
+            recognizer
+                .tick_momentum_at(now + Duration::from_millis(8 * 16))
+                .is_none()
+        );
     }
 
     #[test]

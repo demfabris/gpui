@@ -6271,6 +6271,17 @@ impl Window {
         self.touch_gestures.tuning()
     }
 
+    /// Ends the touch fling this window is turning into momentum scroll
+    /// events, if there is one. On the next frame its stream closes with a
+    /// zero-delta [`TouchPhase::Ended`](crate::TouchPhase::Ended) at the pan's
+    /// start, and no more momentum follows, so the frame source can go idle.
+    /// A scroll listener that consumed the fling calls this, such as a pager
+    /// that already settled on its next page. Momentum the platform produces
+    /// itself, like a macOS trackpad's, is not affected.
+    pub fn end_touch_momentum(&mut self) {
+        self.touch_gestures.end_momentum();
+    }
+
     /// Whether recognized touch pans may use the platform's predicted touch
     /// positions ([`TouchEvent::predicted_position`]) to compensate for input
     /// latency. Defaults to true.
@@ -10182,6 +10193,66 @@ mod tests {
                 bounds.left().0 as i32..bounds.right().0 as i32
             })
             .collect()
+    }
+
+    #[gpui::test]
+    fn ending_touch_momentum_lets_the_frame_source_idle(cx: &mut TestAppContext) {
+        struct PagerView(Rc<RefCell<Vec<(TouchPhase, Pixels)>>>);
+        impl Render for PagerView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let seen = self.0.clone();
+                div().size_full().on_scroll_wheel(move |event, window, _| {
+                    let delta = event.delta.pixel_delta(px(16.)).x;
+                    let mut seen = seen.borrow_mut();
+                    if event.touch_phase == TouchPhase::Ended
+                        && !seen.iter().any(|(phase, _)| *phase == TouchPhase::Ended)
+                    {
+                        window.end_touch_momentum();
+                    }
+                    seen.push((event.touch_phase, delta));
+                })
+            }
+        }
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let seen = seen.clone();
+            move |_, _| PagerView(seen)
+        });
+        let touch = TouchId(1);
+        dispatch_touch(window, cx, touch, TouchPhase::Started, 300.);
+        for step in 1..=5 {
+            std::thread::sleep(Duration::from_millis(4));
+            dispatch_touch(
+                window,
+                cx,
+                touch,
+                TouchPhase::Moved,
+                300. - step as f32 * 40.,
+            );
+        }
+        dispatch_touch(window, cx, touch, TouchPhase::Ended, 100.);
+        assert_eq!(
+            seen.borrow().last().map(|(phase, _)| *phase),
+            Some(TouchPhase::Ended)
+        );
+        let release_events = seen.borrow().len();
+
+        window
+            .update(cx, |_, window, cx| {
+                assert_eq!(window.simulate_next_frame(cx), 1);
+                assert_eq!(
+                    window.simulate_next_frame(cx),
+                    0,
+                    "an ended fling must not schedule more momentum ticks"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            seen.borrow()[release_events..],
+            [(TouchPhase::Ended, px(0.))],
+            "the fling closes with one zero-delta Ended"
+        );
     }
 
     fn dispatch_touch<T: 'static>(
